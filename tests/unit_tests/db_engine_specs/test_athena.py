@@ -190,3 +190,63 @@ def test_get_schema_from_engine_params() -> None:
         )
         is None
     )
+
+
+def test_epoch_to_dttm() -> None:
+    from superset.db_engine_specs.athena import AthenaEngineSpec
+
+    assert AthenaEngineSpec.epoch_to_dttm() == "from_unixtime({col})"
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("MyColumn", "mycolumn"),
+        ("UPPER_CASE", "upper_case"),
+        ("already_lower", "already_lower"),
+        ("MixedCase123", "mixedcase123"),
+        ("", ""),
+    ],
+)
+def test_mutate_label(label: str, expected: str) -> None:
+    from superset.db_engine_specs.athena import AthenaEngineSpec
+
+    assert AthenaEngineSpec._mutate_label(label) == expected
+
+
+def test_time_grain_expressions() -> None:
+    from superset.constants import TimeGrain
+    from superset.db_engine_specs.athena import AthenaEngineSpec
+
+    expressions = AthenaEngineSpec._time_grain_expressions
+    assert expressions[None] == "{col}"
+    assert expressions[TimeGrain.SECOND] == (
+        "date_trunc('second', CAST({col} AS TIMESTAMP))"
+    )
+    assert expressions[TimeGrain.YEAR] == (
+        "date_trunc('year', CAST({col} AS TIMESTAMP))"
+    )
+    assert TimeGrain.WEEK_ENDING_SATURDAY in expressions
+    assert TimeGrain.WEEK_STARTING_SUNDAY in expressions
+
+
+def test_class_attributes() -> None:
+    from superset.db_engine_specs.athena import AthenaEngineSpec
+
+    assert AthenaEngineSpec.engine == "awsathena"
+    assert AthenaEngineSpec.engine_name == "Amazon Athena"
+    assert AthenaEngineSpec.allows_escaped_colons is False
+    assert AthenaEngineSpec.disable_ssh_tunneling is True
+    assert AthenaEngineSpec.use_equality_for_boolean_filters is True
+    assert AthenaEngineSpec.supports_dynamic_schema is True
+
+
+def test_adjust_engine_params_returns_connect_args_unchanged() -> None:
+    from superset.db_engine_specs.athena import AthenaEngineSpec
+
+    url = make_url("awsathena+rest://athena.us-east-1.amazonaws.com:443/default")
+    connect_args = {"role_arn": "arn:aws:iam::123456789012:role/my-role"}
+    _, result_connect_args = AthenaEngineSpec.adjust_engine_params(
+        url, connect_args, schema="s"
+    )
+    assert result_connect_args is connect_args
