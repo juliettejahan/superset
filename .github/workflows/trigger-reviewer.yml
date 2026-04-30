@@ -43,7 +43,12 @@ jobs:
                 continue;
               }
 
+              // Check if PR has needs-improvement label (author may have fixed issues)
+              const hasNeedsImprovement = (pr.labels || []).some(l => l.name === "needs-improvement");
+
               // Dedup: check if a reviewer comment was already posted
+              // But allow re-review if the PR still has needs-improvement
+              // (meaning the previous review found issues, author fixed, CI re-ran)
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -52,9 +57,12 @@ jobs:
               const alreadyReviewed = comments.some(c =>
                 c.body && c.body.includes("Devin reviewer session spawned")
               );
-              if (alreadyReviewed) {
-                console.log(`PR #${prNumber} already has a reviewer session, skipping.`);
+              if (alreadyReviewed && !hasNeedsImprovement) {
+                console.log(`PR #${prNumber} already has a reviewer session and no issues flagged, skipping.`);
                 continue;
+              }
+              if (alreadyReviewed && hasNeedsImprovement) {
+                console.log(`PR #${prNumber} has needs-improvement label — re-running reviewer after fixes.`);
               }
 
               const prUrl = pr.html_url;
@@ -140,7 +148,7 @@ jobs:
 
               const payload = {
                 playbook_id: "${{ vars.DEVIN_REVIEWER_PLAYBOOK_ID }}",
-                prompt: `Review this test coverage pull request on ${repo}:\n\nPR: #${prNumber} — ${title}\nURL: ${prUrl}\nBranch: ${headBranch} → ${baseBranch}\nLinked Issues: ${issueRefStr}\n\nPR Body:\n${prBody}\n\nFollow the attached playbook to:\n1. Read the source file being tested\n2. Review the PR diff for test quality\n3. Run the tests and check coverage\n4. Post a structured review comment with verdict\n5. If tests pass with ≥90% branch coverage, add the label "ready-for-review"\n6. If coverage is insufficient, add the label "needs-improvement"\n\nIMPORTANT: Before completing, update your structured output with the review data as specified in the playbook's Structured Output section.`,
+                prompt: `Review this test coverage pull request on ${repo}:\n\nPR: #${prNumber} — ${title}\nURL: ${prUrl}\nBranch: ${headBranch} → ${baseBranch}\nLinked Issues: ${issueRefStr}\n\nPR Body:\n${prBody}\n\nFollow the attached playbook to:\n1. Read the source file being tested\n2. Review the PR diff for test quality\n3. Run the tests and check coverage\n4. Post a structured review comment with verdict\n5. If tests pass with ≥90% branch coverage, add the label "ready-for-review" and remove "needs-improvement" if present\n6. If coverage is insufficient or tests fail, add the label "needs-improvement" and remove "ready-for-review" if present\n\nIMPORTANT: Before completing, update your structured output with the review data as specified in the playbook's Structured Output section.`,
                 title: `[Reviewer] ${database}: PR #${prNumber}`,
                 structured_output_schema: reviewerOutputSchema,
                 metadata: {
