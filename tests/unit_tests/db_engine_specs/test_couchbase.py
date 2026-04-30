@@ -176,7 +176,8 @@ def test_build_sqlalchemy_uri_no_port() -> None:
         encryption=True,
     )
     uri = CouchbaseEngineSpec.build_sqlalchemy_uri(parameters)
-    assert "cb.example.com" in uri
+    parsed = make_url(uri)
+    assert parsed.host == "cb.example.com"
     assert "ssl=true" in uri
 
 
