@@ -1,0 +1,186 @@
+name: Respawn From Backlog
+
+# When a test-coverage PR closes (merged or not), check the backlog
+# of open test-coverage issues and spawn the next fixer session if
+# there is capacity.
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  respawn:
+    if: contains(github.event.pull_request.title, '[Test Coverage]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Spawn next session from backlog
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_GIT_TOKEN }}
+          script: |
+            const MAX_CONCURRENT = 10;
+            const org = "${{ secrets.DEVIN_ORG_ID }}";
+            const apiKey = "${{ secrets.DEVIN_API_KEY }}";
+            const playbook = "${{ vars.DEVIN_COVERAGE_PLAYBOOK_ID }}";
+            const reviewerPlaybook = "${{ vars.DEVIN_REVIEWER_PLAYBOOK_ID }}";
+            const repo = context.payload.repository.full_name;
+
+            // 1. Check how many fixer sessions are active
+            const listResp = await fetch(
+              `https://api.devin.ai/v3/organizations/${org}/sessions?tags=fixer&tags=test-coverage`,
+              {
+                headers: {
+                  "Authorization": `Bearer ${apiKey}`,
+                  "Content-Type": "application/json"
+                }
+              }
+            );
+            let activeCount = 0;
+            if (listResp.ok) {
+              const listData = await listResp.json();
+              const allSessions = listData.items || [];
+              activeCount = allSessions.filter(s => s.status === "running").length;
+              console.log(`Active fixer sessions: ${activeCount}/${MAX_CONCURRENT}`);
+              if (activeCount >= MAX_CONCURRENT) {
+                console.log("Concurrency limit reached. No room to spawn.");
+                return;
+              }
+            } else {
+              console.log(`Warning: Could not check active sessions (${listResp.status}), proceeding anyway.`);
+            }
+
+            const slotsAvailable = MAX_CONCURRENT - activeCount;
+            console.log(`Slots available: ${slotsAvailable}`);
+
+            // 2. Get all open test-coverage issues
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: "test-coverage",
+              state: "open",
+              per_page: 100,
+            });
+
+            console.log(`Open test-coverage issues: ${issues.length}`);
+
+            // 3. For each issue, check if it already has an orchestrator/bot comment
+            //    (meaning a session was already spawned for it)
+            let spawned = 0;
+            for (const issue of issues) {
+              if (spawned >= slotsAvailable) break;
+
+              if (!issue.title.includes("[Test Coverage]")) continue;
+
+              // Check if a session was already spawned for this issue
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                per_page: 100,
+              });
+
+              const hasSession = comments.data.some(c =>
+                c.body && (
+                  c.body.includes("Devin fixer session spawned") ||
+                  c.body.includes("Devin session created") ||
+                  c.body.includes("[Orchestrator]")
+                )
+              );
+
+              if (hasSession) {
+                continue;
+              }
+
+              // Extract database name
+              const dbMatch = issue.title.match(/for\s+(\w+?)(?:EngineSpec|Spec)?\s*$/i);
+              const database = dbMatch ? dbMatch[1] : "unknown";
+              const dbLower = database.toLowerCase();
+
+              console.log(`Spawning session for issue #${issue.number}: ${database}`);
+
+              // 4. Structured output schema
+              const fixerOutputSchema = {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "TestCoverageFixerOutput",
+                "type": "object",
+                "required": [
+                  "database_name", "engine_spec_class", "source_file", "test_file",
+                  "issue_number", "coverage_before", "coverage_after",
+                  "tests_added", "tests_passed", "status"
+                ],
+                "properties": {
+                  "database_name": { "type": "string" },
+                  "engine_spec_class": { "type": "string" },
+                  "source_file": { "type": "string" },
+                  "test_file": { "type": "string" },
+                  "issue_number": { "type": "integer" },
+                  "issue_url": { "type": "string" },
+                  "pr_number": { "type": "integer" },
+                  "pr_url": { "type": "string" },
+                  "coverage_before": { "type": "number" },
+                  "coverage_after": { "type": "number" },
+                  "tests_added": { "type": "integer" },
+                  "tests_passed": { "type": "boolean" },
+                  "methods_tested": { "type": "array", "items": { "type": "string" } },
+                  "methods_missing": { "type": "array", "items": { "type": "string" } },
+                  "status": { "type": "string", "enum": ["completed", "failed", "partial"] },
+                  "notes": { "type": "string" }
+                }
+              };
+
+              const payload = {
+                playbook_id: playbook,
+                prompt: `Resolve this test-coverage issue #${issue.number} on ${repo}:\n\nTitle: ${issue.title}\n\nBody:\n${issue.body || ""}\n\nFollow the attached playbook to implement the fix. Create a PR that references issue #${issue.number}.\n\nIMPORTANT: Before completing, update your structured output with the coverage data as specified in the playbook's Structured Output section.`,
+                title: `[Fixer] ${database}: ${issue.title}`,
+                structured_output_schema: fixerOutputSchema,
+                child_playbook_id: reviewerPlaybook,
+                repos: [repo],
+                tags: [
+                  "test-coverage",
+                  "fixer",
+                  "automated",
+                  "trigger-backlog-respawn",
+                  `issue-${issue.number}`,
+                  `repo-${repo.replace("/", "-")}`,
+                  `db-${dbLower}`
+                ]
+              };
+
+              const response = await fetch(
+                `https://api.devin.ai/v3/organizations/${org}/sessions`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Authorization": `Bearer ${apiKey}`,
+                    "Content-Type": "application/json"
+                  },
+                  body: JSON.stringify(payload)
+                }
+              );
+
+              if (!response.ok) {
+                const errorText = await response.text();
+                console.log(`Failed to create session for issue #${issue.number}: ${response.status} ${errorText}`);
+                continue;
+              }
+
+              const data = await response.json();
+              console.log(`Session created: ${data.url} (issue #${issue.number})`);
+
+              // Post comment on issue
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `🔧 **Devin fixer session spawned (backlog respawn)**\n\n- **Session:** ${data.url}\n- **Database:** ${database}\n- **Trigger:** PR closed, slot freed\n- **Child review:** Will auto-spawn a reviewer session when the PR is created`
+                });
+              } catch (e) {
+                console.log(`Warning: Could not post comment on issue #${issue.number}: ${e.message}`);
+              }
+
+              spawned++;
+            }
+
+            console.log(`Backlog respawn complete: ${spawned} new session(s) spawned`);
