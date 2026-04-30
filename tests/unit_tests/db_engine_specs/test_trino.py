@@ -1599,15 +1599,19 @@ def test_get_extra_table_metadata_no_latest_parts(mocker: MockerFixture) -> None
         return_value=[{"column_names": ["ds", "hour"], "name": "partition"}]
     )
     db_mock.has_view = Mock(return_value=False)
+    db_mock.get_extra = Mock(return_value={})
     db_mock.get_df = Mock(return_value=pd.DataFrame({"ds": ["01-01-19"], "hour": [1]}))
 
     with patch.object(
         TrinoEngineSpec, "latest_partition", return_value=(["ds", "hour"], None)
     ):
-        result = TrinoEngineSpec.get_extra_table_metadata(
-            db_mock,
-            Table("test_table", "test_schema"),
-        )
+        with patch.object(
+            TrinoEngineSpec, "_partition_query", return_value="SELECT * FROM partitions"
+        ):
+            result = TrinoEngineSpec.get_extra_table_metadata(
+                db_mock,
+                Table("test_table", "test_schema"),
+            )
 
     assert result["partitions"]["latest"] == {"ds": None, "hour": None}
 
