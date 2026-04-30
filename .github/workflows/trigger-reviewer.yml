@@ -1,0 +1,143 @@
+name: Trigger Devin Test Coverage Reviewer
+
+on:
+  pull_request:
+    types: [opened]
+
+jobs:
+  trigger-reviewer:
+    if: |
+      contains(github.event.pull_request.title, '[Test Coverage]') ||
+      contains(github.event.pull_request.labels.*.name, 'test-coverage')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Devin Reviewer (Child Session)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const title = pr.title;
+            const prNumber = pr.number;
+            const prUrl = pr.html_url;
+            const prBody = pr.body || "";
+            const headBranch = pr.head.ref;
+            const baseBranch = pr.base.ref;
+            const repo = context.payload.repository.full_name;
+
+            // Extract database name from PR title
+            const dbMatch = title.match(/for\s+(\w+?)(?:EngineSpec|Spec)?\s*$/i)
+              || title.match(/test[_\s](\w+)/i);
+            const database = dbMatch ? dbMatch[1] : "unknown";
+            const dbLower = database.toLowerCase();
+
+            // Extract linked issue numbers from PR body
+            const issueRefs = [];
+            const issuePattern = /(?:fixes|closes|resolves|references?)\s+#(\d+)/gi;
+            let match;
+            while ((match = issuePattern.exec(prBody)) !== null) {
+              issueRefs.push(match[1]);
+            }
+            const issueRefStr = issueRefs.length > 0
+              ? issueRefs.map(n => `#${n}`).join(", ")
+              : "N/A";
+
+            console.log(`Triggering Devin reviewer session for ${database} (PR #${prNumber})`);
+            console.log(`Linked issues: ${issueRefStr}`);
+
+            // Structured output schema for the reviewer session
+            const reviewerOutputSchema = {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "title": "TestCoverageReviewerOutput",
+              "type": "object",
+              "required": [
+                "database_name", "pr_number", "verdict",
+                "coverage_achieved", "coverage_met", "tests_pass", "status"
+              ],
+              "properties": {
+                "database_name": { "type": "string", "description": "Name of the DB engine" },
+                "pr_number": { "type": "integer", "description": "GitHub PR number" },
+                "pr_url": { "type": "string", "description": "URL to the PR" },
+                "linked_issue_number": { "type": "integer", "description": "Linked issue number" },
+                "verdict": { "type": "string", "enum": ["approve", "request_changes"] },
+                "coverage_achieved": { "type": "number", "description": "Branch coverage %" },
+                "coverage_target": { "type": "number", "description": "Coverage target (90)" },
+                "coverage_met": { "type": "boolean", "description": "Whether target was met" },
+                "tests_pass": { "type": "boolean", "description": "Whether all tests pass" },
+                "methods_tested": { "type": "array", "items": { "type": "string" } },
+                "methods_missing": { "type": "array", "items": { "type": "string" } },
+                "quality_checklist": {
+                  "type": "object",
+                  "properties": {
+                    "all_methods_tested": { "type": "boolean" },
+                    "happy_paths": { "type": "boolean" },
+                    "edge_cases": { "type": "boolean" },
+                    "error_paths": { "type": "boolean" },
+                    "pytest_conventions": { "type": "boolean" },
+                    "type_hints": { "type": "boolean" },
+                    "license_header": { "type": "boolean" },
+                    "no_any_types": { "type": "boolean" },
+                    "precommit_passes": { "type": "boolean" }
+                  }
+                },
+                "label_applied": { "type": "string", "enum": ["ready-for-review", "needs-improvement", "none"] },
+                "review_summary": { "type": "string", "description": "Summary for human reviewer" },
+                "status": { "type": "string", "enum": ["completed", "failed"] },
+                "notes": { "type": "string" }
+              }
+            };
+
+            const tags = [
+              "test-coverage",
+              "reviewer",
+              "automated",
+              "trigger-github-action",
+              `pr-${prNumber}`,
+              `repo-${repo.replace("/", "-")}`,
+              `db-${dbLower}`
+            ];
+            // Add linked issue tags
+            for (const issueNum of issueRefs) {
+              tags.push(`linked-issue-${issueNum}`);
+            }
+
+            const payload = {
+              playbook_id: "${{ vars.DEVIN_REVIEWER_PLAYBOOK_ID }}",
+              prompt: `Review this test coverage pull request on ${repo}:\n\nPR: #${prNumber} — ${title}\nURL: ${prUrl}\nBranch: ${headBranch} → ${baseBranch}\nLinked Issues: ${issueRefStr}\n\nPR Body:\n${prBody}\n\nFollow the attached playbook to:\n1. Read the source file being tested\n2. Review the PR diff for test quality\n3. Run the tests and check coverage\n4. Post a structured review comment with verdict\n5. If tests pass with ≥90% branch coverage, add the label "ready-for-review"\n6. If coverage is insufficient, add the label "needs-improvement"\n\nIMPORTANT: Before completing, update your structured output with the review data as specified in the playbook's Structured Output section.`,
+              title: `[Reviewer] ${database}: PR #${prNumber}`,
+              structured_output_schema: reviewerOutputSchema,
+              metadata: {
+                repos: [repo]
+              },
+              tags: tags
+            };
+
+            const response = await fetch(
+              `https://api.devin.ai/v3/organizations/${{ secrets.DEVIN_ORG_ID }}/sessions`,
+              {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${{ secrets.DEVIN_API_KEY }}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify(payload)
+              }
+            );
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              core.setFailed(`Devin API returned ${response.status}: ${errorText}`);
+              return;
+            }
+
+            const data = await response.json();
+            console.log(`Devin reviewer session created: ${data.url}`);
+            console.log(`Session ID: ${data.session_id}`);
+
+            // Post a comment on the PR
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `🔍 **Devin reviewer session spawned by GitHub Actions**\n\n- **Session:** ${data.url}\n- **Database:** ${database}\n- **Playbook:** Test Coverage Reviewer\n- **Linked Issues:** ${issueRefStr}\n- **Structured output:** Review verdict and quality checklist will be captured automatically`
+            });
