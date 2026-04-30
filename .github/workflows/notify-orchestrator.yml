@@ -1,0 +1,29 @@
+name: Notify Orchestrator on Push
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "superset/db_engine_specs/**"
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch scan to orchestrator repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REPO_GIT_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: "juliettejahan",
+              repo: "devin-orchestrator",
+              event_type: "superset-push",
+              client_payload: {
+                ref: context.ref,
+                sha: context.sha,
+                pusher: context.actor
+              }
+            });
+            console.log("Dispatched superset-push event to juliettejahan/devin-orchestrator");
