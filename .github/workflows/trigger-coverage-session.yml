@@ -24,7 +24,7 @@ jobs:
 
             // Check how many fixer sessions are currently active
             const listResp = await fetch(
-              `https://api.devin.ai/v3/organizations/${{ secrets.DEVIN_ORG_ID }}/sessions?tag=fixer&tag=test-coverage&status=running&limit=10`,
+              `https://api.devin.ai/v3/organizations/${{ secrets.DEVIN_ORG_ID }}/sessions?tags=fixer&tags=test-coverage`,
               {
                 headers: {
                   "Authorization": `Bearer ${{ secrets.DEVIN_API_KEY }}`,
@@ -34,8 +34,9 @@ jobs:
             );
             if (listResp.ok) {
               const listData = await listResp.json();
-              const activeSessions = (listData.sessions || listData || []);
-              const activeCount = Array.isArray(activeSessions) ? activeSessions.length : 0;
+              const allSessions = listData.items || [];
+              // Count only sessions that are actively running
+              const activeCount = allSessions.filter(s => s.status === "running").length;
               if (activeCount >= MAX_CONCURRENT) {
                 console.log(`Concurrency limit reached: ${activeCount}/${MAX_CONCURRENT} fixer sessions active. Skipping.`);
                 return;
@@ -94,9 +95,7 @@ jobs:
               title: `[Fixer] ${database}: ${title}`,
               structured_output_schema: fixerOutputSchema,
               child_playbook_id: "${{ vars.DEVIN_REVIEWER_PLAYBOOK_ID }}",
-              metadata: {
-                repos: [repo]
-              },
+              repos: [repo],
               tags: [
                 "test-coverage",
                 "fixer",

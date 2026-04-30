@@ -151,9 +151,7 @@ jobs:
                 prompt: `Review this test coverage pull request on ${repo}:\n\nPR: #${prNumber} — ${title}\nURL: ${prUrl}\nBranch: ${headBranch} → ${baseBranch}\nLinked Issues: ${issueRefStr}\n\nPR Body:\n${prBody}\n\nFollow the attached playbook to:\n1. Read the source file being tested\n2. Review the PR diff for test quality\n3. Run the tests and check coverage\n4. Post a structured review comment with verdict\n5. If tests pass with ≥90% branch coverage, add the label "ready-for-review" and remove "needs-improvement" if present\n6. If coverage is insufficient or tests fail, add the label "needs-improvement" and remove "ready-for-review" if present\n\nIMPORTANT: Before completing, update your structured output with the review data as specified in the playbook's Structured Output section.`,
                 title: `[Reviewer] ${database}: PR #${prNumber}`,
                 structured_output_schema: reviewerOutputSchema,
-                metadata: {
-                  repos: [repo]
-                },
+                repos: [repo],
                 tags: tags
               };
 
