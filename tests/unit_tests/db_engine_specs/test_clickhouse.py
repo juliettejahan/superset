@@ -549,8 +549,9 @@ def test_build_sqlalchemy_uri_with_encryption() -> None:
         query={},
     )
     uri = ClickHouseConnectEngineSpec.build_sqlalchemy_uri(parameters)
+    parsed_uri = make_url(uri)
     assert "clickhousedb+connect://" in uri
-    assert "clickhouse.example.com" in uri
+    assert parsed_uri.host == "clickhouse.example.com"
     assert "secure=true" in uri
     assert "analytics" in uri
 
