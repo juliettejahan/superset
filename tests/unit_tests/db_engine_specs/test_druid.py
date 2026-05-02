@@ -21,6 +21,7 @@ from unittest import mock
 import pytest
 from sqlalchemy import column
 
+from superset.exceptions import SupersetException
 from tests.unit_tests.db_engine_specs.utils import assert_convert_dttm
 from tests.unit_tests.fixtures.common import dttm  # noqa: F401
 
@@ -95,3 +96,147 @@ def test_extras_with_ssl() -> None:
     connect_args = extras["engine_params"]["connect_args"]
     assert connect_args["scheme"] == "https"
     assert "ssl_verify_cert" in connect_args
+
+
+def test_extras_with_empty_extra() -> None:
+    """
+    ``get_extra_params`` should treat an empty ``extra`` field as ``{}``.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    database = mock.Mock()
+    database.extra = ""
+    database.server_cert = None
+    extras = DruidEngineSpec.get_extra_params(database)
+    assert extras == {}
+
+
+def test_extras_with_invalid_json_raises() -> None:
+    """
+    ``get_extra_params`` should raise ``SupersetException`` when the database
+    ``extra`` payload is not valid JSON.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    database = mock.Mock()
+    database.extra = "{not valid json"
+    database.server_cert = None
+    with pytest.raises(SupersetException, match="Unable to parse database extras"):
+        DruidEngineSpec.get_extra_params(database)
+
+
+def test_extras_with_ssl_preserves_existing_engine_params() -> None:
+    """
+    When ``extra`` already has ``engine_params.connect_args``, those existing
+    arguments should be preserved while the SSL-related keys are added.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+    from tests.integration_tests.fixtures.certificates import ssl_certificate
+
+    database = mock.Mock()
+    database.extra = (
+        '{"engine_params": {"connect_args": {"existing_key": "existing_value"}}}'
+    )
+    database.server_cert = ssl_certificate
+    extras = DruidEngineSpec.get_extra_params(database)
+    connect_args = extras["engine_params"]["connect_args"]
+    assert connect_args["existing_key"] == "existing_value"
+    assert connect_args["scheme"] == "https"
+    assert "ssl_verify_cert" in connect_args
+
+
+def test_alter_new_orm_column_marks_time_column() -> None:
+    """
+    ``alter_new_orm_column`` should set ``is_dttm=True`` on Druid's reserved
+    ``__time`` column.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    orm_col = mock.Mock()
+    orm_col.column_name = "__time"
+    orm_col.is_dttm = False
+    DruidEngineSpec.alter_new_orm_column(orm_col)
+    assert orm_col.is_dttm is True
+
+
+def test_alter_new_orm_column_leaves_other_columns_unchanged() -> None:
+    """
+    ``alter_new_orm_column`` must not modify non-``__time`` columns.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    orm_col = mock.Mock()
+    orm_col.column_name = "some_other_column"
+    orm_col.is_dttm = False
+    DruidEngineSpec.alter_new_orm_column(orm_col)
+    assert orm_col.is_dttm is False
+
+
+def test_epoch_to_dttm() -> None:
+    """
+    ``epoch_to_dttm`` returns the SQL template that converts seconds since
+    epoch into a timestamp.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    assert DruidEngineSpec.epoch_to_dttm() == "MILLIS_TO_TIMESTAMP({col} * 1000)"
+
+
+def test_epoch_ms_to_dttm() -> None:
+    """
+    ``epoch_ms_to_dttm`` returns the SQL template that converts milliseconds
+    since epoch into a timestamp.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    assert DruidEngineSpec.epoch_ms_to_dttm() == "MILLIS_TO_TIMESTAMP({col})"
+
+
+def test_get_dbapi_exception_mapping() -> None:
+    """
+    The DBAPI exception mapping should map ``requests.ConnectionError`` to
+    ``SupersetDBAPIConnectionError``.
+    """
+    from requests import exceptions as requests_exceptions
+
+    from superset.db_engine_specs.druid import DruidEngineSpec
+    from superset.db_engine_specs.exceptions import SupersetDBAPIConnectionError
+
+    mapping = DruidEngineSpec.get_dbapi_exception_mapping()
+    assert mapping == {
+        requests_exceptions.ConnectionError: SupersetDBAPIConnectionError
+    }
+
+
+def test_engine_metadata() -> None:
+    """
+    Sanity-check the static engine metadata exposed by ``DruidEngineSpec``.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    assert DruidEngineSpec.engine == "druid"
+    assert DruidEngineSpec.engine_name == "Apache Druid"
+    assert DruidEngineSpec.allows_subqueries is True
+    assert DruidEngineSpec.type_probe_needs_row is True
+
+
+def test_convert_dttm_with_microseconds(dttm: datetime) -> None:  # noqa: F811
+    """
+    ``convert_dttm`` should drop sub-second precision when emitting
+    ``TIME_PARSE`` for ``DateTime`` / ``TIMESTAMP`` targets.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    result = DruidEngineSpec.convert_dttm("DateTime", dttm)
+    assert result == "TIME_PARSE('2019-01-02T03:04:05')"
+
+
+def test_convert_dttm_date_uses_iso_date(dttm: datetime) -> None:  # noqa: F811
+    """
+    ``convert_dttm`` should emit ``CAST(TIME_PARSE(...) AS DATE)`` using the
+    ISO date representation of the input ``datetime``.
+    """
+    from superset.db_engine_specs.druid import DruidEngineSpec
+
+    result = DruidEngineSpec.convert_dttm("DATE", dttm)
+    assert result == "CAST(TIME_PARSE('2019-01-02') AS DATE)"
