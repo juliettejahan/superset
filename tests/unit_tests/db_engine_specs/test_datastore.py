@@ -542,6 +542,10 @@ def test_get_client_default_credentials_passes_database(
     mock_client_cls = mocker.patch(
         "superset.db_engine_specs.datastore.datastore.Client"
     )
+    mocker.patch(
+        "superset.db_engine_specs.datastore.google.auth.default",
+        return_value=(mocker.MagicMock(), "my-project"),
+    )
 
     engine = mocker.MagicMock()
     engine.dialect.credentials_info = None
@@ -983,3 +987,399 @@ def test_get_catalog_names(mocker: MockerFixture) -> None:
 
     result = DatastoreEngineSpec.get_catalog_names(database, inspector)
     assert result == {"my-project"}
+
+
+def test_get_client_default_credentials_no_database(mocker: MockerFixture) -> None:
+    """
+    Test that ``_get_client`` falls back to default credentials and passes
+    ``database=None`` when the URL has no ``database`` query parameter.
+    """
+
+    mock_client_cls = mocker.patch(
+        "superset.db_engine_specs.datastore.datastore.Client"
+    )
+    mocker.patch(
+        "superset.db_engine_specs.datastore.google.auth.default",
+        return_value=(mocker.MagicMock(), "my-project"),
+    )
+
+    engine = mocker.MagicMock()
+    engine.dialect.credentials_info = None
+    engine.url.query = {}
+
+    database = mocker.MagicMock()
+
+    DatastoreEngineSpec._get_client(engine, database)
+    mock_client_cls.assert_called_once_with(credentials=mocker.ANY, database=None)
+
+
+def test_parameters_json_schema_returns_none_without_schema(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test that ``parameters_json_schema`` returns ``None`` when the engine spec
+    has no ``parameters_schema`` defined.
+    """
+
+    mocker.patch.object(DatastoreEngineSpec, "parameters_schema", None)
+    assert DatastoreEngineSpec.parameters_json_schema() is None
+
+
+def test_parse_error_exception_fallback_on_construction_failure() -> None:
+    """
+    Test ``parse_error_exception`` returns the original exception when the
+    exception type cannot be reconstructed from a single string argument.
+
+    Some exception subclasses require multiple positional arguments in their
+    ``__init__`` (e.g. ``code`` plus ``message``). In that case, calling
+    ``type(exception)("...")`` raises ``TypeError``; the helper should fall
+    back to returning the original exception unchanged.
+    """
+
+    class StrictError(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    original = StrictError(500, "boom\nsecond line")
+    result = DatastoreEngineSpec.parse_error_exception(original)
+    assert result is original
+
+
+def test_parse_error_exception_empty_message() -> None:
+    """
+    Test ``parse_error_exception`` returns the original exception when the
+    exception's string form has no lines (empty string).
+    """
+
+    original = Exception("")
+    result = DatastoreEngineSpec.parse_error_exception(original)
+    assert result is original
+
+
+def test_module_dependencies_not_installed_attribute(mocker: MockerFixture) -> None:
+    """
+    Test that the ``dependencies_installed`` flag in the module can be
+    monkeypatched, exercising the ``ImportError`` fallback path indirectly
+    by validating the runtime check it controls.
+    """
+    from superset.exceptions import SupersetException
+
+    mocker.patch(
+        "superset.db_engine_specs.datastore.dependencies_installed",
+        False,
+    )
+    engine = mocker.MagicMock()
+    database = mocker.MagicMock()
+
+    with pytest.raises(SupersetException, match="Could not import"):
+        DatastoreEngineSpec._get_client(engine, database)
+
+
+def test_select_star_with_no_array_columns(mocker: MockerFixture) -> None:
+    """
+    Test ``select_star`` with columns but none of them are arrays, so no
+    columns should be filtered out.
+    """
+
+    cols: list[ResultSetColumnType] = [
+        {
+            "column_name": "name",
+            "name": "name",
+            "type": sqltypes.String(),
+            "nullable": True,
+            "comment": None,
+            "default": None,
+            "precision": None,
+            "scale": None,
+            "max_length": None,
+            "is_dttm": False,
+        },
+        {
+            "column_name": "age",
+            "name": "age",
+            "type": sqltypes.Integer(),
+            "nullable": True,
+            "comment": None,
+            "default": None,
+            "precision": None,
+            "scale": None,
+            "max_length": None,
+            "is_dttm": False,
+        },
+    ]
+
+    database = mocker.MagicMock()
+    database.compile_sqla_query = lambda query, catalog, schema: str(
+        query.compile(
+            dialect=CloudDatastoreDialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    dialect = CloudDatastoreDialect()
+
+    sql = DatastoreEngineSpec.select_star(
+        database=database,
+        table=Table("my_table"),
+        dialect=dialect,
+        limit=100,
+        show_cols=True,
+        indent=True,
+        latest_partition=False,
+        cols=cols,
+    )
+    assert "name" in sql
+    assert "age" in sql
+    assert "FROM my_table" in sql
+
+
+def test_engine_class_attributes() -> None:
+    """
+    Test the static configuration attributes of ``DatastoreEngineSpec``.
+    """
+    from superset.sql.parse import LimitMethod
+
+    assert DatastoreEngineSpec.engine == "datastore"
+    assert DatastoreEngineSpec.engine_name == "Google Datastore"
+    assert DatastoreEngineSpec.default_driver == "datastore"
+    assert DatastoreEngineSpec.max_column_name_length == 128
+    assert DatastoreEngineSpec.disable_ssh_tunneling is True
+    assert DatastoreEngineSpec.run_multiple_statements_as_one is True
+    assert DatastoreEngineSpec.allows_hidden_cc_in_orderby is True
+    assert DatastoreEngineSpec.supports_dynamic_schema is True
+    assert DatastoreEngineSpec.supports_catalog is True
+    assert DatastoreEngineSpec.supports_dynamic_catalog is True
+    assert DatastoreEngineSpec.supports_cross_catalog_queries is True
+    assert DatastoreEngineSpec.limit_method == LimitMethod.FETCH_MANY
+    assert DatastoreEngineSpec.arraysize == 5000
+    assert DatastoreEngineSpec.encrypted_extra_sensitive_fields == {
+        "$.credentials_info.private_key"
+    }
+
+
+def test_metadata_describes_database() -> None:
+    """
+    Test the metadata dictionary that drives the database picker UI.
+    """
+    metadata = DatastoreEngineSpec.metadata
+    assert metadata["logo"] == "datastore.png"
+    assert metadata["homepage_url"] == "https://cloud.google.com/datastore/"
+    assert "python-datastore-sqlalchemy" in metadata["pypi_packages"]
+    assert metadata["connection_string"].startswith("datastore://")
+    auth_methods = metadata["authentication_methods"]
+    assert len(auth_methods) == 1
+    assert auth_methods[0]["name"] == "Service Account JSON"
+
+
+def test_time_grain_expressions_have_required_grains() -> None:
+    """
+    Test that the ``_time_grain_expressions`` dictionary supports the
+    grains the Datastore spec advertises.
+    """
+    from superset.constants import TimeGrain
+
+    grains = DatastoreEngineSpec._time_grain_expressions
+    expected_grains = {
+        None,
+        TimeGrain.SECOND,
+        TimeGrain.MINUTE,
+        TimeGrain.FIVE_MINUTES,
+        TimeGrain.TEN_MINUTES,
+        TimeGrain.FIFTEEN_MINUTES,
+        TimeGrain.THIRTY_MINUTES,
+        TimeGrain.HOUR,
+        TimeGrain.DAY,
+        TimeGrain.WEEK,
+        TimeGrain.WEEK_STARTING_MONDAY,
+        TimeGrain.MONTH,
+        TimeGrain.QUARTER,
+        TimeGrain.YEAR,
+    }
+    assert expected_grains.issubset(set(grains.keys()))
+    # The default identity expression should preserve the column name.
+    assert grains[None] == "{col}"
+
+
+def test_date_trunc_functions() -> None:
+    """
+    Test the ``_date_trunc_functions`` mapping covers the SQL date types.
+    """
+    funcs = DatastoreEngineSpec._date_trunc_functions
+    assert funcs["DATE"] == "DATE_TRUNC"
+    assert funcs["DATETIME"] == "DATETIME_TRUNC"
+    assert funcs["TIME"] == "TIME_TRUNC"
+    assert funcs["TIMESTAMP"] == "TIMESTAMP_TRUNC"
+
+
+def test_custom_errors_match_expected_patterns() -> None:
+    """
+    Test the ``custom_errors`` regex-to-message mapping triggers on the
+    expected error strings.
+    """
+
+    errors = DatastoreEngineSpec.custom_errors
+    permission_msg = (
+        "Access Denied: Project my-project: User does not have "
+        "datastore.databases.create permission in project my-project"
+    )
+    table_msg = (
+        'Table name "my_table" missing dataset while no default '
+        "dataset is set in the request"
+    )
+    column_msg = "Unrecognized name: my_col at [3:14]"
+    schema_msg = "datastore error: 404 Not found: Dataset proj:my_schema was not found in location"  # noqa: E501
+    syntax_msg = 'Syntax error: Expected end of input but got identifier "FROM"'
+
+    assert any(pattern.search(permission_msg) for pattern in errors)
+    assert any(pattern.search(table_msg) for pattern in errors)
+    assert any(pattern.search(column_msg) for pattern in errors)
+    assert any(pattern.search(schema_msg) for pattern in errors)
+    assert any(pattern.search(syntax_msg) for pattern in errors)
+
+
+def test_mutate_label_label_unchanged_no_hash() -> None:
+    """
+    Test ``_mutate_label`` does not append a hash suffix when the label
+    requires no mutation.
+    """
+
+    label = "regular_label"
+    result = DatastoreEngineSpec._mutate_label(label)
+    # No change, so no hash suffix appended.
+    assert result == label
+
+
+def test_truncate_label_distinct_inputs_produce_distinct_outputs() -> None:
+    """
+    Test ``_truncate_label`` is deterministic and discriminates between
+    different inputs.
+    """
+
+    a = DatastoreEngineSpec._truncate_label("alpha")
+    b = DatastoreEngineSpec._truncate_label("beta")
+    a_again = DatastoreEngineSpec._truncate_label("alpha")
+    assert a == a_again
+    assert a != b
+    assert a.startswith("_")
+
+
+def test_get_default_catalog_uses_database_path(mocker: MockerFixture) -> None:
+    """
+    Test that ``get_default_catalog`` returns the project from the URL
+    database part when the host is empty.
+    """
+    from superset.models.core import Database
+
+    mocker.patch.object(Database, "get_sqla_engine")
+    mocker.patch.object(DatastoreEngineSpec, "_get_client")
+
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="datastore:///path-project",
+    )
+    assert DatastoreEngineSpec.get_default_catalog(database) == "path-project"
+
+
+def test_get_dbapi_exception_mapping_imports_lazily() -> None:
+    """
+    Test ``get_dbapi_exception_mapping`` imports DefaultCredentialsError
+    from ``google.auth.exceptions`` lazily and exposes the canonical
+    Superset connection-error class as the target.
+    """
+    from google.auth.exceptions import DefaultCredentialsError
+
+    from superset.db_engine_specs.exceptions import SupersetDBAPIConnectionError
+
+    mapping = DatastoreEngineSpec.get_dbapi_exception_mapping()
+    assert mapping == {DefaultCredentialsError: SupersetDBAPIConnectionError}
+
+
+def test_get_parameters_from_uri_with_query_params() -> None:
+    """
+    Test that ``get_parameters_from_uri`` round-trips multiple query
+    parameters into the ``query`` dict.
+    """
+
+    encrypted_extra = {"credentials_info": {"project_id": "p", "private_key": "K"}}
+    result = DatastoreEngineSpec.get_parameters_from_uri(
+        "datastore://p/?database=my-db&foo=bar",
+        encrypted_extra,
+    )
+    assert result["query"] == {"database": "my-db", "foo": "bar"}
+
+
+def test_validate_parameters_does_not_raise() -> None:
+    """
+    Test ``validate_parameters`` is a no-op for arbitrary inputs.
+    """
+
+    properties: dict[str, dict[str, str]] = {
+        "parameters": {"anything": "goes"},
+    }
+    # Cast to expected type via direct call; the implementation ignores
+    # the input completely.
+    assert DatastoreEngineSpec.validate_parameters(properties) == []  # type: ignore[arg-type]
+
+
+def test_module_import_handles_missing_google_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Test that the module reports ``dependencies_installed = False`` when the
+    optional Google Cloud Datastore dependencies are missing at import time.
+
+    The module catches ``ImportError`` when ``google.cloud.datastore`` (and
+    related packages) are not installed, falling back to ``False`` so the
+    runtime check in ``_get_client`` can surface a friendly error.
+    """
+    import importlib
+    import sys
+
+    # Save original modules so we can restore them after the test.
+    saved_modules: dict[str, object] = {}
+    for name in list(sys.modules):
+        if name.startswith("google") or name == "superset.db_engine_specs.datastore":
+            saved_modules[name] = sys.modules[name]
+
+    try:
+        # Remove the cached datastore module and any google.* modules so the
+        # reimport will hit the ImportError fallback.
+        for name in list(sys.modules):
+            if (
+                name.startswith("google")
+                or name == "superset.db_engine_specs.datastore"
+            ):
+                del sys.modules[name]
+
+        # Block the ``google.cloud.datastore`` import to trigger the
+        # ImportError branch on module load.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(
+            name: str,
+            globals: dict[str, object] | None = None,  # noqa: A002
+            locals: dict[str, object] | None = None,  # noqa: A002
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name in {
+                "google.auth",
+                "google.cloud",
+                "google.oauth2",
+            } or name.startswith(("google.auth.", "google.cloud.", "google.oauth2.")):
+                raise ImportError(f"forced failure for {name}")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+
+        reloaded = importlib.import_module("superset.db_engine_specs.datastore")
+        assert reloaded.dependencies_installed is False
+    finally:
+        # Restore real modules and reload the datastore module so subsequent
+        # tests use the correct (working) implementation.
+        monkeypatch.undo()
+        for name, mod in saved_modules.items():
+            sys.modules[name] = mod  # type: ignore[assignment]
+        importlib.reload(sys.modules["superset.db_engine_specs.datastore"])
