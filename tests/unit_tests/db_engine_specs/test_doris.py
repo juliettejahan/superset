@@ -27,6 +27,7 @@ from superset.db_engine_specs.doris import (
     AggState,
     ARRAY,
     BITMAP,
+    DEFAULT_CATALOG,
     DOUBLE,
     HLL,
     LARGEINT,
@@ -35,6 +36,7 @@ from superset.db_engine_specs.doris import (
     STRUCT,
     TINYINT,
 )
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 from superset.utils.core import GenericDataType
 from tests.unit_tests.db_engine_specs.utils import assert_column_spec
 
@@ -275,3 +277,238 @@ def test_get_catalog_names(
 
     # Verify the returned catalog names
     assert catalogs == expected_result
+
+
+def test_get_default_catalog_falls_back_to_default(mocker: MockerFixture) -> None:
+    """
+    When the URI has no catalog and ``SHOW CATALOGS`` returns no current catalog,
+    ``get_default_catalog`` should fall back to ``DEFAULT_CATALOG``.
+    """
+    from superset.db_engine_specs.doris import DorisEngineSpec
+    from superset.models.core import Database
+
+    database = mocker.MagicMock(spec=Database)
+    database.url_object.database = "schema_only"
+    rows = [
+        mocker.MagicMock(IsCurrent=False, CatalogName="catalog1"),
+        mocker.MagicMock(IsCurrent=False, CatalogName="catalog2"),
+    ]
+    with database.get_sqla_engine() as engine:
+        engine.execute.return_value = rows
+
+    assert DorisEngineSpec.get_default_catalog(database) == DEFAULT_CATALOG
+    assert DEFAULT_CATALOG == "internal"
+
+
+def test_array_python_type() -> None:
+    """``ARRAY.python_type`` should return ``list``."""
+    assert ARRAY().python_type is list
+
+
+def test_map_python_type() -> None:
+    """``MAP.python_type`` should return ``dict``."""
+    assert MAP().python_type is dict
+
+
+def test_struct_python_type() -> None:
+    """``STRUCT.python_type`` should return ``None`` (no native Python type)."""
+    assert STRUCT().python_type is None
+
+
+@pytest.mark.parametrize(
+    "type_class,visit_name",
+    [
+        (TINYINT, "TINYINT"),
+        (LARGEINT, "LARGEINT"),
+        (DOUBLE, "DOUBLE"),
+        (HLL, "HLL"),
+        (BITMAP, "BITMAP"),
+        (QuantileState, "QUANTILE_STATE"),
+        (AggState, "AGG_STATE"),
+        (ARRAY, "ARRAY"),
+        (MAP, "MAP"),
+        (STRUCT, "STRUCT"),
+    ],
+)
+def test_custom_type_visit_names(
+    type_class: type[types.TypeEngine], visit_name: str
+) -> None:
+    """Each Doris-specific SQLAlchemy type exposes the expected ``__visit_name__``."""
+    assert type_class().__visit_name__ == visit_name
+
+
+def test_engine_metadata() -> None:
+    """Sanity-check class-level attributes used for connection registration."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    assert DorisEngineSpec.engine == "pydoris"
+    assert DorisEngineSpec.engine_aliases == {"doris"}
+    assert DorisEngineSpec.engine_name == "Apache Doris"
+    assert DorisEngineSpec.default_driver == "pydoris"
+    assert DorisEngineSpec.max_column_name_length == 64
+    assert DorisEngineSpec.encryption_parameters == {"ssl": "0"}
+    assert DorisEngineSpec.supports_dynamic_schema is True
+    assert DorisEngineSpec.supports_catalog is True
+    assert DorisEngineSpec.supports_dynamic_catalog is True
+    assert DorisEngineSpec.supports_cross_catalog_queries is False
+    assert DorisEngineSpec.metadata["default_port"] == 9030
+    assert "pydoris" in DorisEngineSpec.metadata["pypi_packages"]
+
+
+def test_extract_errors_access_denied() -> None:
+    """An access-denied error message should map to a structured Superset error."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Access denied for user 'alice'@'1.2.3.4' (using password: YES)"
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert result == [
+        SupersetError(
+            error_type=SupersetErrorType.CONNECTION_ACCESS_DENIED_ERROR,
+            message='Either the username "alice" or the password is incorrect.',
+            level=ErrorLevel.ERROR,
+            extra={
+                "engine_name": "Apache Doris",
+                "invalid": ["username", "password"],
+                "issue_codes": [
+                    {
+                        "code": 1014,
+                        "message": (
+                            "Issue 1014 - Either the username or the password is wrong."
+                        ),
+                    },
+                    {
+                        "code": 1015,
+                        "message": (
+                            "Issue 1015 - Either the database is spelled "
+                            "incorrectly or does not exist."
+                        ),
+                    },
+                ],
+            },
+        )
+    ]
+
+
+def test_extract_errors_invalid_hostname() -> None:
+    """An unknown-host error should map to ``CONNECTION_INVALID_HOSTNAME_ERROR``."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Unknown Doris server host 'doris.invalid' (8)"
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.CONNECTION_INVALID_HOSTNAME_ERROR
+    assert error.message == 'Unknown Doris server host "doris.invalid".'
+    assert error.level == ErrorLevel.ERROR
+    assert error.extra is not None
+    assert error.extra["engine_name"] == "Apache Doris"
+    assert error.extra["invalid"] == ["host"]
+
+
+def test_extract_errors_host_down() -> None:
+    """A connection-refused error should map to ``CONNECTION_HOST_DOWN_ERROR``."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Can't connect to Doris server on 'doris.example.com' (110)"
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.CONNECTION_HOST_DOWN_ERROR
+    assert (
+        error.message
+        == 'The host "doris.example.com" might be down and can\'t be reached.'
+    )
+    assert error.extra is not None
+    assert error.extra["invalid"] == ["host", "port"]
+
+
+def test_extract_errors_unknown_database() -> None:
+    """An unknown-database error should map to ``CONNECTION_UNKNOWN_DATABASE_ERROR``."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Unknown database 'nope_db'"
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.CONNECTION_UNKNOWN_DATABASE_ERROR
+    assert error.message == 'Unable to connect to database "nope_db".'
+    assert error.extra is not None
+    assert error.extra["invalid"] == ["database"]
+
+
+def test_extract_errors_syntax_error() -> None:
+    """A syntax error message should map to ``SYNTAX_ERROR``."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = (
+        "You have an error in your SQL syntax; check the manual that "
+        "corresponds to your MySQL server version for the right syntax to "
+        "use near 'SLECT * FROM t' at line 1"
+    )
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.SYNTAX_ERROR
+    assert "SLECT * FROM t" in error.message
+
+
+def test_extract_errors_generic_fallback() -> None:
+    """An error that matches no custom regex should fall back to a generic error."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Some completely unrelated, unmatched failure message"
+    result = DorisEngineSpec.extract_errors(Exception(msg))
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.GENERIC_DB_ENGINE_ERROR
+    assert error.message == msg
+    assert error.extra is not None
+    assert error.extra["engine_name"] == "Apache Doris"
+
+
+def test_extract_errors_with_context() -> None:
+    """Context should be merged into ``extra`` alongside regex captures."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    msg = "Unknown Doris server host 'foo.bar' (8)"
+    result = DorisEngineSpec.extract_errors(
+        Exception(msg), context={"hostname": "foo.bar"}
+    )
+
+    assert len(result) == 1
+    error = result[0]
+    assert error.error_type == SupersetErrorType.CONNECTION_INVALID_HOSTNAME_ERROR
+    assert error.extra is not None
+    assert error.extra["engine_name"] == "Apache Doris"
+
+
+def test_get_schema_from_engine_params_with_url_encoded_schema() -> None:
+    """URL-encoded schema names should be decoded when extracted from the URI."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    assert (
+        DorisEngineSpec.get_schema_from_engine_params(
+            make_url("doris://localhost:9030/catalog.my%20schema"),
+            {},
+        )
+        == "my schema"
+    )
+
+
+def test_get_default_catalog_with_uri_catalog(mocker: MockerFixture) -> None:
+    """When the URI contains ``catalog.schema``, the catalog should be returned
+    without consulting the engine."""
+    from superset.db_engine_specs.doris import DorisEngineSpec
+    from superset.models.core import Database
+
+    database = mocker.MagicMock(spec=Database)
+    database.url_object.database = "my_catalog.my_schema"
+
+    assert DorisEngineSpec.get_default_catalog(database) == "my_catalog"
+    database.get_sqla_engine.assert_not_called()
