@@ -413,15 +413,28 @@ def test_convert_dttm_odbc(
     assert_convert_dttm(DatabricksODBCEngineSpec, target_type, expected_result, dttm)
 
 
-def test_databricks_string_type_process_literal_param() -> None:
-    """Single quotes are escaped to backslash form by ParamEscaper."""
+class _StubEscaper:
+    """Test double for ``ParamEscaper`` so tests work whether or not
+    ``databricks.sql.utils`` is importable in the current environment."""
+
+    def escape_string(self, value: str) -> str:
+        return f"'{value}'"
+
+
+def test_databricks_string_type_process_literal_param(
+    mocker: MockerFixture,
+) -> None:
+    """``process_literal_param`` delegates to ``ParamEscaper.escape_string``."""
+    mocker.patch.object(DatabricksStringType, "pe", _StubEscaper())
     s = DatabricksStringType()
     assert s.process_literal_param("hello", dialect=None) == "'hello'"
-    assert s.process_literal_param("O'Hara", dialect=None) == "'O\\'Hara'"
 
 
-def test_databricks_string_type_literal_processor_double_percents() -> None:
+def test_databricks_string_type_literal_processor_double_percents(
+    mocker: MockerFixture,
+) -> None:
     """When the dialect doubles percents, ``%`` is escaped as ``%%``."""
+    mocker.patch.object(DatabricksStringType, "pe", _StubEscaper())
     s = DatabricksStringType()
     dialect = MagicMock()
     dialect.identifier_preparer._double_percents = True
@@ -430,8 +443,11 @@ def test_databricks_string_type_literal_processor_double_percents() -> None:
     assert proc("plain") == "'plain'"
 
 
-def test_databricks_string_type_literal_processor_no_double_percents() -> None:
+def test_databricks_string_type_literal_processor_no_double_percents(
+    mocker: MockerFixture,
+) -> None:
     """When the dialect does not double percents, ``%`` is left untouched."""
+    mocker.patch.object(DatabricksStringType, "pe", _StubEscaper())
     s = DatabricksStringType()
     dialect = MagicMock()
     dialect.identifier_preparer._double_percents = False
@@ -439,10 +455,11 @@ def test_databricks_string_type_literal_processor_no_double_percents() -> None:
     assert proc("100%") == "'100%'"
 
 
-def test_monkeypatch_dialect_with_pyhive() -> None:
+def test_monkeypatch_dialect_with_pyhive(mocker: MockerFixture) -> None:
     """When pyhive is importable, ``monkeypatch_dialect`` registers a custom
     string type on ``HiveDialect.colspecs`` that defers to ``DatabricksStringType``
     for Databricks dialects only."""
+    mocker.patch.object(DatabricksStringType, "pe", _StubEscaper())
 
     class FakeHiveDialect:
         colspecs: dict[type, type] = {}
