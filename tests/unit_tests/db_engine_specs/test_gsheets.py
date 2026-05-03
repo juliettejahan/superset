@@ -1047,18 +1047,17 @@ def test_needs_oauth2_no_user_in_g(mocker: MockerFixture) -> None:
 
 def test_needs_oauth2_oauth2_redirect_error(mocker: MockerFixture) -> None:
     """
-    `needs_oauth2` returns True when the exception is an `OAuth2RedirectError`.
+    `needs_oauth2` returns True for any `cls.oauth2_exception` subclass.
     """
     from superset.db_engine_specs.gsheets import GSheetsEngineSpec
 
     g = mocker.patch("superset.db_engine_specs.gsheets.g")
     g.user = mocker.MagicMock()
 
-    ex = GSheetsEngineSpec.oauth2_exception(
-        url="https://example.com",
-        tab_id="t1",
-        redirect_uri="https://callback",
-    )
+    # Build a synthetic instance that passes `isinstance(ex, cls.oauth2_exception)`,
+    # without depending on the constructor signature of whatever the current
+    # `oauth2_exception` happens to be (other tests may swap it out).
+    ex = mocker.MagicMock(spec=GSheetsEngineSpec.oauth2_exception)
     assert GSheetsEngineSpec.needs_oauth2(ex) is True
 
 
