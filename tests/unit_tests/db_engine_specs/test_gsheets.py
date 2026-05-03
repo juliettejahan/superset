@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import pytest
+from marshmallow.exceptions import ValidationError
 from pytest_mock import MockerFixture
 from requests.exceptions import HTTPError
 from sqlalchemy.engine.url import make_url
@@ -1002,3 +1003,474 @@ def test_validate_parameters_skips_oauth2_connections_with_masked_encrypted_extr
 
     assert errors == []
     conn.execute.assert_not_called()
+
+
+def test_get_oauth2_authorization_uri_with_pkce(
+    mocker: MockerFixture,
+    oauth2_config: OAuth2ClientConfig,
+) -> None:
+    """
+    PKCE parameters are added when a `code_verifier` is supplied.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    state: OAuth2State = {
+        "database_id": 1,
+        "user_id": 1,
+        "default_redirect_uri": "http://localhost:8088/api/v1/oauth2/",
+        "tab_id": "1234",
+    }
+
+    url = GSheetsEngineSpec.get_oauth2_authorization_uri(
+        oauth2_config, state, code_verifier="verifier-1234567890"
+    )
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+
+    assert "code_challenge" in query
+    assert query["code_challenge_method"][0] == "S256"
+
+
+def test_needs_oauth2_no_user_in_g(mocker: MockerFixture) -> None:
+    """
+    `needs_oauth2` returns False when `g` has no `user` attribute.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    # An object without a `user` attribute and with `__bool__ == True`.
+    fake_g = type("FakeG", (), {"__bool__": lambda self: True})()
+    mocker.patch("superset.db_engine_specs.gsheets.g", new=fake_g)
+
+    ex = Exception("credentials do not contain the necessary fields")
+    assert GSheetsEngineSpec.needs_oauth2(ex) is False
+
+
+def test_needs_oauth2_oauth2_redirect_error(mocker: MockerFixture) -> None:
+    """
+    `needs_oauth2` returns True when the exception is an `OAuth2RedirectError`.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    g = mocker.patch("superset.db_engine_specs.gsheets.g")
+    g.user = mocker.MagicMock()
+
+    ex = GSheetsEngineSpec.oauth2_exception(
+        url="https://example.com",
+        tab_id="t1",
+        redirect_uri="https://callback",
+    )
+    assert GSheetsEngineSpec.needs_oauth2(ex) is True
+
+
+def test_impersonate_user_username_user_not_found(mocker: MockerFixture) -> None:
+    """
+    `impersonate_user` does not modify the URL when the user cannot be found.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    mocker.patch(
+        "superset.db_engine_specs.gsheets.security_manager.find_user",
+        return_value=None,
+    )
+    database = mocker.MagicMock()
+
+    url, kwargs = GSheetsEngineSpec.impersonate_user(
+        database,
+        username="missing-user",
+        user_token=None,
+        url=make_url("gsheets://"),
+        engine_kwargs={},
+    )
+    assert url == make_url("gsheets://")
+    assert kwargs == {}
+
+
+def test_impersonate_user_username_user_without_email(
+    mocker: MockerFixture,
+) -> None:
+    """
+    `impersonate_user` does not modify the URL when the user has no email.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    user = mocker.MagicMock()
+    user.email = None
+    mocker.patch(
+        "superset.db_engine_specs.gsheets.security_manager.find_user",
+        return_value=user,
+    )
+    database = mocker.MagicMock()
+
+    url, kwargs = GSheetsEngineSpec.impersonate_user(
+        database,
+        username="bob",
+        user_token=None,
+        url=make_url("gsheets://"),
+        engine_kwargs={},
+    )
+    assert url == make_url("gsheets://")
+    assert kwargs == {}
+
+
+def test_impersonate_user_no_username_no_token(mocker: MockerFixture) -> None:
+    """
+    `impersonate_user` is a no-op when neither a username nor a token is supplied.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    find_user = mocker.patch(
+        "superset.db_engine_specs.gsheets.security_manager.find_user",
+    )
+    database = mocker.MagicMock()
+
+    url, kwargs = GSheetsEngineSpec.impersonate_user(
+        database,
+        username=None,
+        user_token=None,
+        url=make_url("gsheets://"),
+        engine_kwargs={"foo": "bar"},
+    )
+    assert url == make_url("gsheets://")
+    assert kwargs == {"foo": "bar"}
+    find_user.assert_not_called()
+
+
+def test_get_extra_table_metadata(mocker: MockerFixture) -> None:
+    """
+    `get_extra_table_metadata` returns the parsed metadata payload.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    database = mocker.MagicMock()
+    raw_conn = database.get_raw_connection.return_value.__enter__.return_value
+    cursor = raw_conn.cursor.return_value
+    cursor.fetchone.return_value = (
+        json.dumps({"extra": {"sheet_id": "abc", "rows": 42}}),
+    )
+
+    table = Table("sheet1", schema=None, catalog=None)
+    metadata = GSheetsEngineSpec.get_extra_table_metadata(database, table)
+
+    assert metadata == {"metadata": {"sheet_id": "abc", "rows": 42}}
+    cursor.execute.assert_called_once_with('SELECT GET_METADATA("sheet1")')
+
+
+def test_get_extra_table_metadata_invalid_json(mocker: MockerFixture) -> None:
+    """
+    `get_extra_table_metadata` falls back when parsing the metadata fails.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    database = mocker.MagicMock()
+    raw_conn = database.get_raw_connection.return_value.__enter__.return_value
+    cursor = raw_conn.cursor.return_value
+    cursor.fetchone.return_value = ("not valid json",)
+
+    table = Table("sheet1", schema=None, catalog=None)
+    # The empty fallback metadata dict does not contain an `extra` key, so the
+    # attempt to look it up raises `KeyError`. This locks down the existing
+    # behaviour and exercises the JSON-parse exception branch.
+    with pytest.raises(KeyError):
+        GSheetsEngineSpec.get_extra_table_metadata(database, table)
+
+
+def test_build_sqlalchemy_uri_with_oauth2(mocker: MockerFixture) -> None:
+    """
+    `build_sqlalchemy_uri` strips `oauth2_client_info` from `encrypted_extra`.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    encrypted_extra: dict[str, Any] = {
+        "oauth2_client_info": {"id": "client", "secret": "shh"},
+        "service_account_info": {"project_id": "p"},
+    }
+    uri = GSheetsEngineSpec.build_sqlalchemy_uri(
+        {},
+        encrypted_extra=encrypted_extra,
+    )
+    assert uri == "gsheets://"
+    assert "oauth2_client_info" not in encrypted_extra
+
+
+def test_build_sqlalchemy_uri_without_encrypted_extra() -> None:
+    """
+    `build_sqlalchemy_uri` returns the placeholder when no extra is passed.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    uri = GSheetsEngineSpec.build_sqlalchemy_uri({}, encrypted_extra=None)
+    assert uri == "gsheets://"
+
+
+def test_update_params_from_encrypted_extra_no_oauth2(mocker: MockerFixture) -> None:
+    """
+    `update_params_from_encrypted_extra` works when `oauth2_client_info` is absent.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    database = mocker.MagicMock(
+        encrypted_extra=json.dumps({"foo": "bar"}),
+    )
+    params: dict[str, Any] = {}
+    GSheetsEngineSpec.update_params_from_encrypted_extra(database, params)
+    assert params == {"foo": "bar"}
+
+
+def test_get_parameters_from_uri_with_extra() -> None:
+    """
+    `get_parameters_from_uri` returns the encrypted extra when present.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    encrypted_extra = {"service_account_info": {"project_id": "p"}}
+    result = GSheetsEngineSpec.get_parameters_from_uri(
+        "gsheets://", encrypted_extra=encrypted_extra
+    )
+    assert result == encrypted_extra
+
+
+def test_get_parameters_from_uri_without_extra() -> None:
+    """
+    `get_parameters_from_uri` raises a `ValidationError` when no extra is provided.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    with pytest.raises(ValidationError):
+        GSheetsEngineSpec.get_parameters_from_uri("gsheets://", encrypted_extra=None)
+
+
+def test_parameters_json_schema() -> None:
+    """
+    `parameters_json_schema` returns an OpenAPI component schema dict.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    schema = GSheetsEngineSpec.parameters_json_schema()
+    assert isinstance(schema, dict)
+    assert "properties" in schema
+    properties = schema["properties"]
+    assert "service_account_info" in properties
+    assert "oauth2_client_info" in properties
+    assert "catalog" in properties
+
+
+def test_parameters_json_schema_no_schema(mocker: MockerFixture) -> None:
+    """
+    `parameters_json_schema` returns `None` when no schema is configured.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    mocker.patch.object(GSheetsEngineSpec, "parameters_schema", new=None)
+    assert GSheetsEngineSpec.parameters_json_schema() is None
+
+
+def test_validate_parameters_dict_credentials(mocker: MockerFixture) -> None:
+    """
+    `validate_parameters` accepts dict-typed `service_account_info`.
+    """
+    from superset.db_engine_specs.gsheets import (
+        GSheetsEngineSpec,
+        GSheetsPropertiesType,
+    )
+
+    g = mocker.patch("superset.db_engine_specs.gsheets.g")
+    g.user.email = "admin@example.com"
+
+    create_engine = mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+    conn = create_engine.return_value.connect.return_value
+    conn.execute.return_value.fetchall.return_value = [(1,)]
+
+    properties: GSheetsPropertiesType = {
+        "parameters": {
+            "service_account_info": {"project_id": "p", "private_key": "k"},  # type: ignore[typeddict-item]
+            "catalog": {"my_sheet": "https://docs.google.com/spreadsheets/d/1/edit"},
+        },
+        "catalog": {},
+    }
+    errors = GSheetsEngineSpec.validate_parameters(properties)
+    assert errors == []
+    create_engine.assert_called_with(
+        "gsheets://",
+        service_account_info={"project_id": "p", "private_key": "k"},
+        subject="admin@example.com",
+    )
+
+
+def test_validate_parameters_no_user(mocker: MockerFixture) -> None:
+    """
+    `validate_parameters` falls back to a `None` subject when no user is logged in.
+    """
+    from superset.db_engine_specs.gsheets import (
+        GSheetsEngineSpec,
+        GSheetsPropertiesType,
+    )
+
+    g = mocker.patch("superset.db_engine_specs.gsheets.g")
+    g.user = None
+
+    create_engine = mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+    conn = create_engine.return_value.connect.return_value
+    conn.execute.return_value.fetchall.return_value = [(1,)]
+
+    properties: GSheetsPropertiesType = {
+        "parameters": {
+            "service_account_info": "",
+            "catalog": {"my_sheet": "https://docs.google.com/spreadsheets/d/1/edit"},
+        },
+        "catalog": {},
+    }
+    errors = GSheetsEngineSpec.validate_parameters(properties)
+    assert errors == []
+    create_engine.assert_called_with(
+        "gsheets://",
+        service_account_info={},
+        subject=None,
+    )
+
+
+def test_validate_parameters_missing_url(mocker: MockerFixture) -> None:
+    """
+    `validate_parameters` flags catalog entries with empty URLs.
+    """
+    from superset.db_engine_specs.gsheets import (
+        GSheetsEngineSpec,
+        GSheetsPropertiesType,
+    )
+
+    g = mocker.patch("superset.db_engine_specs.gsheets.g")
+    g.user.email = "admin@example.com"
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    properties: GSheetsPropertiesType = {
+        "parameters": {
+            "service_account_info": "",
+            "catalog": {"my_sheet": ""},
+        },
+        "catalog": {},
+    }
+    errors = GSheetsEngineSpec.validate_parameters(properties)
+    assert errors == [
+        SupersetError(
+            message="URL is required",
+            error_type=SupersetErrorType.CONNECTION_MISSING_PARAMETERS_ERROR,
+            level=ErrorLevel.WARNING,
+            extra={"catalog": {"idx": 0, "url": True}},
+        ),
+    ]
+
+
+def test_do_post_logs_and_raises_on_error(mocker: MockerFixture) -> None:
+    """
+    `_do_post` raises `SupersetException` when the API responds with an error.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    session = mocker.MagicMock()
+    session.post.return_value.json.return_value = {"error": {"message": "Bad request"}}
+
+    with pytest.raises(SupersetException) as excinfo:
+        GSheetsEngineSpec._do_post(  # noqa: SLF001
+            session, "https://api.example.com", {"key": "value"}
+        )
+    assert str(excinfo.value) == "Bad request"
+
+
+def test_do_post_returns_payload(mocker: MockerFixture) -> None:
+    """
+    `_do_post` returns the parsed payload on success.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    session = mocker.MagicMock()
+    session.post.return_value.json.return_value = {"ok": True}
+
+    payload = GSheetsEngineSpec._do_post(  # noqa: SLF001
+        session, "https://api.example.com", {"k": "v"}
+    )
+    assert payload == {"ok": True}
+    session.post.assert_called_once_with("https://api.example.com", json={"k": "v"})
+
+
+def test_df_to_sql_unknown_if_exists_creates_new(mocker: MockerFixture) -> None:
+    """
+    `df_to_sql` creates a new sheet when no entry exists, regardless of `if_exists`.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    mocker.patch("superset.db_engine_specs.gsheets.db")
+    get_adapter_for_table_name = mocker.patch(
+        "shillelagh.backends.apsw.dialects.base.get_adapter_for_table_name"
+    )
+    session = get_adapter_for_table_name()._get_session()  # noqa: SLF001
+    session.post().json.return_value = {
+        "spreadsheetId": "id-1",
+        "spreadsheetUrl": "https://docs.example.org",
+        "sheets": [{"properties": {"title": "sample_data"}}],
+    }
+
+    database = mocker.MagicMock()
+    database.get_extra.return_value = {}
+
+    df = pd.DataFrame({"col": [1, 2]})
+    table = Table("sample_data")
+
+    GSheetsEngineSpec.df_to_sql(database, table, df, {"if_exists": "ignore-me"})
+    assert database.extra == json.dumps(
+        {"engine_params": {"catalog": {"sample_data": "https://docs.example.org"}}}
+    )
+
+
+def test_df_to_sql_existing_with_unknown_if_exists(mocker: MockerFixture) -> None:
+    """
+    `df_to_sql` falls through when `if_exists` is unknown but the table exists.
+
+    Covers the branch where `spreadsheet_url` is truthy, `if_exists` is set, but
+    its value matches none of `append` / `fail` / `replace`, so the existing
+    sheet is cleared and reused.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    mocker.patch("superset.db_engine_specs.gsheets.db")
+    get_adapter_for_table_name = mocker.patch(
+        "shillelagh.backends.apsw.dialects.base.get_adapter_for_table_name"
+    )
+    adapter = get_adapter_for_table_name()
+    adapter._spreadsheet_id = "id-1"  # noqa: SLF001
+    adapter._sheet_name = "sheet0"  # noqa: SLF001
+    session = adapter._get_session()  # noqa: SLF001
+    session.post().json.return_value = {}
+
+    database = mocker.MagicMock()
+    database.get_extra.return_value = {
+        "engine_params": {
+            "catalog": {"sample_data": "https://docs.example.org"},
+        },
+    }
+
+    df = pd.DataFrame({"col": [1]})
+    table = Table("sample_data")
+
+    GSheetsEngineSpec.df_to_sql(database, table, df, {"if_exists": "unknown"})
+    assert "https://sheets.googleapis.com/v4/spreadsheets/id-1/values/sheet0:clear" in [
+        call.args[0] for call in session.post.call_args_list if call.args
+    ]
+
+
+def test_get_table_names_no_oauth2(mocker: MockerFixture) -> None:
+    """
+    `get_table_names` skips the OAuth2 dance when OAuth2 is not enabled.
+    """
+    from superset.db_engine_specs.gsheets import GSheetsEngineSpec
+
+    mocker.patch(
+        "superset.db_engine_specs.shillelagh.ShillelaghEngineSpec.get_table_names",
+        return_value={"sheet1"},
+    )
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = False
+    inspector = mocker.MagicMock()
+
+    result = GSheetsEngineSpec.get_table_names(database, inspector, None)
+    assert result == {"sheet1"}
+    database.start_oauth2_dance.assert_not_called()
