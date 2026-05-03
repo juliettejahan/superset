@@ -136,7 +136,7 @@ def test_engine_metadata() -> None:
     metadata = DynamoDBEngineSpec.metadata
     assert "PartiQL" in metadata["description"]
     assert metadata["logo"] == "aws.png"
-    assert metadata["homepage_url"].startswith("https://aws.amazon.com")
+    assert metadata["homepage_url"] == "https://aws.amazon.com/dynamodb/"
     assert metadata["pypi_packages"] == ["pydynamodb"]
     assert "connector=superset" in metadata["connection_string"]
     assert set(metadata["parameters"].keys()) == {
