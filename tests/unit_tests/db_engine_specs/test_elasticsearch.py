@@ -74,13 +74,13 @@ def test_elasticsearch_metadata_drivers() -> None:
     assert recommended["name"] == "Elasticsearch SQL API (Recommended)"
     assert recommended["pypi_package"] == "elasticsearch-dbapi"
     assert recommended["is_recommended"] is True
-    assert "elasticsearch+https://" in recommended["connection_string"]
+    assert recommended["connection_string"].startswith("elasticsearch+https://")
 
     opendistro = drivers[1]
     assert opendistro["name"] == "OpenDistro / OpenSearch SQL"
     assert opendistro["pypi_package"] == "elasticsearch-dbapi"
     assert opendistro["is_recommended"] is False
-    assert "odelasticsearch+https://" in opendistro["connection_string"]
+    assert opendistro["connection_string"].startswith("odelasticsearch+https://")
 
 
 def test_elasticsearch_metadata_compatible_databases() -> None:
@@ -91,7 +91,8 @@ def test_elasticsearch_metadata_compatible_databases() -> None:
     assert elastic_cloud["name"] == "Elastic Cloud"
     assert DatabaseCategory.SEARCH_NOSQL in elastic_cloud["categories"]
     assert DatabaseCategory.HOSTED_OPEN_SOURCE in elastic_cloud["categories"]
-    assert "cloud.es.io" in elastic_cloud["connection_string"]
+    assert elastic_cloud["connection_string"].startswith("elasticsearch+https://")
+    assert elastic_cloud["connection_string"].endswith(".cloud.es.io:9243/")
 
     aws = databases[1]
     assert aws["name"] == "Amazon OpenSearch Service"
