@@ -74,13 +74,17 @@ def test_elasticsearch_metadata_drivers() -> None:
     assert recommended["name"] == "Elasticsearch SQL API (Recommended)"
     assert recommended["pypi_package"] == "elasticsearch-dbapi"
     assert recommended["is_recommended"] is True
-    assert recommended["connection_string"].startswith("elasticsearch+https://")
+    assert recommended["connection_string"] == (
+        "elasticsearch+https://{user}:{password}@{host}:9243/"
+    )
 
     opendistro = drivers[1]
     assert opendistro["name"] == "OpenDistro / OpenSearch SQL"
     assert opendistro["pypi_package"] == "elasticsearch-dbapi"
     assert opendistro["is_recommended"] is False
-    assert opendistro["connection_string"].startswith("odelasticsearch+https://")
+    assert opendistro["connection_string"] == (
+        "odelasticsearch+https://{user}:{password}@{host}:9200/"
+    )
 
 
 def test_elasticsearch_metadata_compatible_databases() -> None:
@@ -91,8 +95,10 @@ def test_elasticsearch_metadata_compatible_databases() -> None:
     assert elastic_cloud["name"] == "Elastic Cloud"
     assert DatabaseCategory.SEARCH_NOSQL in elastic_cloud["categories"]
     assert DatabaseCategory.HOSTED_OPEN_SOURCE in elastic_cloud["categories"]
-    assert elastic_cloud["connection_string"].startswith("elasticsearch+https://")
-    assert elastic_cloud["connection_string"].endswith(".cloud.es.io:9243/")
+    assert elastic_cloud["connection_string"] == (
+        "elasticsearch+https://{user}:{password}@{deployment}.{region}"
+        ".cloud.es.io:9243/"
+    )
 
     aws = databases[1]
     assert aws["name"] == "Amazon OpenSearch Service"
