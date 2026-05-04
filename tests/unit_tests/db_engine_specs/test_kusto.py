@@ -275,7 +275,10 @@ def test_sql_metadata_structure() -> None:
     metadata = KustoSqlEngineSpec.metadata
     assert "description" in metadata
     assert metadata["logo"] == "kusto.png"
-    assert metadata["homepage_url"].startswith("https://azure.microsoft.com")
+    assert (
+        metadata["homepage_url"]
+        == "https://azure.microsoft.com/en-us/products/data-explorer/"
+    )
     assert DatabaseCategory.CLOUD_AZURE in metadata["categories"]
     assert DatabaseCategory.ANALYTICAL_DATABASES in metadata["categories"]
     assert DatabaseCategory.PROPRIETARY in metadata["categories"]
