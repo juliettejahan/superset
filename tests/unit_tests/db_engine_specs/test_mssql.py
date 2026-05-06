@@ -430,3 +430,250 @@ def test_denormalize_name(name: str, expected_result: str):
     from superset.db_engine_specs.mssql import MssqlEngineSpec as spec  # noqa: N813
 
     assert spec.denormalize_name(mssql.dialect(), name) == expected_result
+
+
+def test_epoch_to_dttm() -> None:
+    """
+    Test the `epoch_to_dttm` method returns the expected SQL expression.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    assert MssqlEngineSpec.epoch_to_dttm() == "dateadd(S, {col}, '1970-01-01')"
+    assert (
+        MssqlEngineSpec.epoch_to_dttm().format(col="ts_col")
+        == "dateadd(S, ts_col, '1970-01-01')"
+    )
+
+
+def test_engine_class_attributes() -> None:
+    """
+    Verify static class attributes that affect query generation behavior.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    assert MssqlEngineSpec.engine == "mssql"
+    assert MssqlEngineSpec.engine_name == "Microsoft SQL Server"
+    assert MssqlEngineSpec.max_column_name_length == 128
+    assert MssqlEngineSpec.allows_cte_in_subquery is False
+    assert MssqlEngineSpec.supports_multivalues_insert is True
+
+
+@pytest.mark.parametrize(
+    "time_grain,expected_fragment",
+    [
+        ("PT1S", "DATEADD(SECOND,"),
+        ("PT1M", "DATEADD(MINUTE, DATEDIFF(MINUTE, 0, [MixedCase]), 0)"),
+        ("PT5M", "/ 5 * 5, 0)"),
+        ("PT10M", "/ 10 * 10, 0)"),
+        ("PT15M", "/ 15 * 15, 0)"),
+        ("PT30M", "/ 30 * 30, 0)"),
+        ("PT1H", "DATEADD(HOUR, DATEDIFF(HOUR, 0, [MixedCase]), 0)"),
+        ("P1D", "DATEADD(DAY, DATEDIFF(DAY, 0, [MixedCase]), 0)"),
+        ("P1W", "DATEPART(WEEKDAY, [MixedCase])"),
+        ("P1M", "DATEADD(MONTH, DATEDIFF(MONTH, 0, [MixedCase]), 0)"),
+        ("P3M", "DATEADD(QUARTER, DATEDIFF(QUARTER, 0, [MixedCase]), 0)"),
+        ("P1Y", "DATEADD(YEAR, DATEDIFF(YEAR, 0, [MixedCase]), 0)"),
+        (
+            "1969-12-28T00:00:00Z/P1W",
+            "DATEADD(DAY, -1, DATEADD(WEEK, DATEDIFF(WEEK, 0, [MixedCase]), 0))",
+        ),
+        (
+            "1969-12-29T00:00:00Z/P1W",
+            "DATEADD(WEEK, DATEDIFF(WEEK, 0, DATEADD(DAY, -1, [MixedCase])), 0)",
+        ),
+    ],
+)
+def test_time_grain_expressions(time_grain: str, expected_fragment: str) -> None:
+    """
+    Verify each supported `_time_grain_expressions` compiles and contains the
+    expected SQL fragment.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    col = column("MixedCase")
+    expr = MssqlEngineSpec.get_timestamp_expr(col, None, time_grain)
+    result = str(expr.compile(None, dialect=mssql.dialect()))
+    assert expected_fragment in result
+
+
+def test_time_grain_none_returns_column() -> None:
+    """
+    A `None` time grain should pass through the column expression unchanged.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    col = column("MixedCase")
+    expr = MssqlEngineSpec.get_timestamp_expr(col, None, None)
+    result = str(expr.compile(None, dialect=mssql.dialect()))
+    assert result == "[MixedCase]"
+
+
+def test_convert_dttm_unknown_type() -> None:
+    """
+    Unknown column types should return None instead of raising.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    target = datetime(2023, 6, 15, 12, 0, 0)
+    assert MssqlEngineSpec.convert_dttm("UNKNOWN_TYPE", target) is None
+
+
+def test_convert_dttm_with_db_extra() -> None:
+    """
+    Passing a `db_extra` argument should not affect the conversion result.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    target = datetime(2024, 12, 31, 23, 59, 59, 999000)
+    assert (
+        MssqlEngineSpec.convert_dttm("DATE", target, db_extra={"engine_params": {}})
+        == "CONVERT(DATE, '2024-12-31', 23)"
+    )
+
+
+def test_convert_dttm_datetime_microseconds_truncated_to_milliseconds() -> None:
+    """
+    `DATETIME` conversion should keep millisecond precision (truncate microseconds).
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    target = datetime(2024, 1, 2, 3, 4, 5, 678999)
+    assert (
+        MssqlEngineSpec.convert_dttm("DATETIME", target)
+        == "CONVERT(DATETIME, '2024-01-02T03:04:05.678', 126)"
+    )
+
+
+def test_convert_dttm_smalldatetime_drops_subseconds() -> None:
+    """
+    `SMALLDATETIME` conversion uses 'YYYY-MM-DD HH:MM:SS' (no subseconds).
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    target = datetime(2024, 1, 2, 3, 4, 5, 678999)
+    assert (
+        MssqlEngineSpec.convert_dttm("smalldatetime", target)
+        == "CONVERT(SMALLDATETIME, '2024-01-02 03:04:05', 20)"
+    )
+
+
+def test_convert_dttm_date_ignores_time_component() -> None:
+    """
+    `DATE` conversion should use only the calendar date part of the datetime.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    target = datetime(2024, 7, 4, 23, 59, 59, 999999)
+    assert (
+        MssqlEngineSpec.convert_dttm("DATE", target)
+        == "CONVERT(DATE, '2024-07-04', 23)"
+    )
+
+
+def test_extract_error_message_no_match() -> None:
+    """
+    `extract_error_message` should fall back to the generic prefix for non-8155
+    errors.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    ex = Exception("Some unrelated error message")
+    result = MssqlEngineSpec.extract_error_message(ex)
+    assert result.startswith("mssql error: ")
+    assert "Some unrelated error message" in result
+
+
+def test_get_dbapi_exception_mapping_inherits_default() -> None:
+    """
+    `MssqlEngineSpec` does not override `get_dbapi_exception_mapping`, so it
+    should return the (empty) mapping from the base class.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    mapping = MssqlEngineSpec.get_dbapi_exception_mapping()
+    assert isinstance(mapping, dict)
+
+
+def test_smalldatetime_column_type_mapping() -> None:
+    """
+    `smalldatetime` native type should map to `SMALLDATETIME` and be flagged as
+    a temporal type.
+    """
+    from sqlalchemy.dialects.mssql.base import SMALLDATETIME
+
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    column_spec = MssqlEngineSpec.get_column_spec("smalldatetime")
+    assert column_spec is not None
+    assert isinstance(column_spec.sqla_type, SMALLDATETIME)
+    assert column_spec.generic_type == GenericDataType.TEMPORAL
+    assert column_spec.is_dttm is True
+
+
+def test_uniqueidentifier_column_type_mapping() -> None:
+    """
+    `uniqueidentifier` native type should map to the custom `GUID` type and be
+    treated as a string column.
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    column_spec = MssqlEngineSpec.get_column_spec("uniqueidentifier")
+    assert column_spec is not None
+    assert isinstance(column_spec.sqla_type, GUID)
+    assert column_spec.generic_type == GenericDataType.STRING
+    assert column_spec.is_dttm is False
+
+
+def test_extract_errors_unrecognized_message() -> None:
+    """
+    Unrecognized errors should fall back to the base class default extraction
+    (a single generic Superset error).
+    """
+    from superset.db_engine_specs.mssql import MssqlEngineSpec
+
+    msg = "Some completely unrelated error that no regex matches"
+    result = MssqlEngineSpec.extract_errors(Exception(msg))
+    assert len(result) == 1
+    assert result[0].error_type == SupersetErrorType.GENERIC_DB_ENGINE_ERROR
+
+
+def test_azure_synapse_spec_attributes() -> None:
+    """
+    `AzureSynapseSpec` shares the mssql engine but advertises a different
+    engine name, default driver, and metadata.
+    """
+    from superset.db_engine_specs.mssql import AzureSynapseSpec, MssqlEngineSpec
+
+    assert issubclass(AzureSynapseSpec, MssqlEngineSpec)
+    assert AzureSynapseSpec.engine == "mssql"
+    assert AzureSynapseSpec.engine_name == "Azure Synapse"
+    assert AzureSynapseSpec.default_driver == "pyodbc"
+    assert "Azure Synapse Analytics" in AzureSynapseSpec.metadata["description"]
+    assert AzureSynapseSpec.metadata["logo"] == "azure.svg"
+
+
+def test_azure_synapse_inherits_convert_dttm(
+    dttm: datetime,  # noqa: F811
+) -> None:
+    """
+    `AzureSynapseSpec` should inherit `convert_dttm` semantics from MssqlEngineSpec.
+    """
+    from superset.db_engine_specs.mssql import AzureSynapseSpec
+
+    assert (
+        AzureSynapseSpec.convert_dttm("DATE", dttm) == "CONVERT(DATE, '2019-01-02', 23)"
+    )
+    assert (
+        AzureSynapseSpec.convert_dttm("DATETIME", dttm)
+        == "CONVERT(DATETIME, '2019-01-02T03:04:05.678', 126)"
+    )
+    assert AzureSynapseSpec.convert_dttm("OTHER", dttm) is None
+
+
+def test_azure_synapse_epoch_to_dttm() -> None:
+    """
+    `AzureSynapseSpec.epoch_to_dttm` should match MssqlEngineSpec's expression.
+    """
+    from superset.db_engine_specs.mssql import AzureSynapseSpec
+
+    assert AzureSynapseSpec.epoch_to_dttm() == "dateadd(S, {col}, '1970-01-01')"
