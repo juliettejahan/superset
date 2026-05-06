@@ -283,3 +283,297 @@ def test_adjust_engine_params_with_catalog(
         url, {}, catalog=catalog, schema=schema
     )
     assert returned_url.database == expected_database
+
+
+def test_array_python_type() -> None:
+    """
+    Test that the ``ARRAY`` SQLAlchemy type maps to the Python ``list`` type.
+    """
+    assert ARRAY().python_type is list
+
+
+def test_map_python_type() -> None:
+    """
+    Test that the ``MAP`` SQLAlchemy type maps to the Python ``dict`` type.
+    """
+    assert MAP().python_type is dict
+
+
+def test_struct_python_type() -> None:
+    """
+    Test that the ``STRUCT`` SQLAlchemy type has no concrete Python type.
+    """
+    assert STRUCT().python_type is None
+
+
+def test_engine_spec_basic_attributes() -> None:
+    """
+    Test that the StarRocks engine spec exposes the expected basic attributes.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    assert StarRocksEngineSpec.engine == "starrocks"
+    assert StarRocksEngineSpec.engine_name == "StarRocks"
+    assert StarRocksEngineSpec.default_driver == "starrocks"
+    assert StarRocksEngineSpec.supports_dynamic_schema is True
+    assert StarRocksEngineSpec.supports_catalog is True
+    assert StarRocksEngineSpec.supports_dynamic_catalog is True
+    assert StarRocksEngineSpec.supports_cross_catalog_queries is True
+
+
+def test_custom_errors_access_denied() -> None:
+    """
+    Test the access-denied custom error regex captures the username group.
+    """
+    from superset.db_engine_specs.starrocks import (
+        CONNECTION_ACCESS_DENIED_REGEX,
+        StarRocksEngineSpec,
+    )
+
+    msg = "Access denied for user 'alice'@'localhost'"
+    match = CONNECTION_ACCESS_DENIED_REGEX.search(msg)
+    assert match is not None
+    assert match.group("username") == "alice"
+    assert CONNECTION_ACCESS_DENIED_REGEX in StarRocksEngineSpec.custom_errors
+
+
+def test_custom_errors_unknown_database() -> None:
+    """
+    Test the unknown-database custom error regex captures the database group.
+    """
+    from superset.db_engine_specs.starrocks import (
+        CONNECTION_UNKNOWN_DATABASE_REGEX,
+        StarRocksEngineSpec,
+    )
+
+    msg = "Unknown database 'sales'"
+    match = CONNECTION_UNKNOWN_DATABASE_REGEX.search(msg)
+    assert match is not None
+    assert match.group("database") == "sales"
+    assert CONNECTION_UNKNOWN_DATABASE_REGEX in StarRocksEngineSpec.custom_errors
+
+
+def test_get_default_catalog_with_no_database(mocker: MockerFixture) -> None:
+    """
+    Test that ``get_default_catalog`` returns the default constant when the
+    URI has no database component.
+    """
+    from superset.db_engine_specs.starrocks import (
+        DEFAULT_CATALOG,
+        StarRocksEngineSpec,
+    )
+
+    database = mocker.MagicMock()
+    database.url_object.database = None
+
+    assert StarRocksEngineSpec.get_default_catalog(database) == DEFAULT_CATALOG
+
+
+def test_get_schema_from_engine_params_strips_slashes() -> None:
+    """
+    Test that ``get_schema_from_engine_params`` URL-decodes the schema portion
+    after splitting on the catalog separator.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    assert (
+        StarRocksEngineSpec.get_schema_from_engine_params(
+            make_url("starrocks://localhost:9030/hive.my%20schema"),
+            {},
+        )
+        == "my schema"
+    )
+
+
+def test_get_schema_from_engine_params_only_slashes() -> None:
+    """
+    Test that ``get_schema_from_engine_params`` returns ``None`` when the
+    database is just slashes (treated as empty after stripping).
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    url = make_url("starrocks://localhost:9030")
+    url = url.set(database="/")
+    assert StarRocksEngineSpec.get_schema_from_engine_params(url, {}) is None
+
+
+def test_get_catalog_names_with_attribute_access(mocker: MockerFixture) -> None:
+    """
+    Test ``get_catalog_names`` falls back to attribute access when the row
+    object does not implement ``keys()``.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    inspector = mocker.MagicMock()
+
+    class _AttrRow:
+        def __init__(self, name: str) -> None:
+            self.Catalog = name
+
+    inspector.bind.execute.return_value = [
+        _AttrRow("default_catalog"),
+        _AttrRow("hive"),
+    ]
+
+    catalogs = StarRocksEngineSpec.get_catalog_names(database, inspector)
+    inspector.bind.execute.assert_called_once_with("SHOW CATALOGS")
+    assert catalogs == {"default_catalog", "hive"}
+
+
+def test_get_catalog_names_with_indexed_access(mocker: MockerFixture) -> None:
+    """
+    Test ``get_catalog_names`` falls back to positional indexing when neither
+    ``keys()`` nor a ``Catalog`` attribute are available.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    inspector = mocker.MagicMock()
+
+    inspector.bind.execute.return_value = [
+        ("default_catalog", "internal", ""),
+        ("hive", "external", "Hive metastore"),
+    ]
+
+    catalogs = StarRocksEngineSpec.get_catalog_names(database, inspector)
+    assert catalogs == {"default_catalog", "hive"}
+
+
+def test_get_catalog_names_keys_without_catalog_falls_through(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Test ``get_catalog_names`` falls through to indexing when ``keys()`` is
+    present but does not include "Catalog" and the row has no ``Catalog``
+    attribute.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    inspector = mocker.MagicMock()
+
+    class _Row:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def keys(self) -> list[str]:
+            return ["Name", "Type"]
+
+        def __getitem__(self, idx: int) -> str:
+            return self._name
+
+    inspector.bind.execute.return_value = [_Row("alpha"), _Row("beta")]
+
+    catalogs = StarRocksEngineSpec.get_catalog_names(database, inspector)
+    assert catalogs == {"alpha", "beta"}
+
+
+def test_get_catalog_names_skips_bad_rows(mocker: MockerFixture) -> None:
+    """
+    Test ``get_catalog_names`` logs a warning and skips a row that raises
+    when extracting the catalog name (still returning the good rows).
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    inspector = mocker.MagicMock()
+
+    class _GoodRow:
+        Catalog = "good"
+
+    class _BadRow:
+        def keys(self) -> list[str]:
+            return ["Catalog"]
+
+        def __getitem__(self, key: str) -> str:
+            raise KeyError(key)
+
+    inspector.bind.execute.return_value = [_GoodRow(), _BadRow()]
+
+    catalogs = StarRocksEngineSpec.get_catalog_names(database, inspector)
+    assert catalogs == {"good"}
+
+
+def test_get_catalog_names_handles_execute_failure(mocker: MockerFixture) -> None:
+    """
+    Test ``get_catalog_names`` returns an empty set when SHOW CATALOGS raises.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    inspector = mocker.MagicMock()
+    inspector.bind.execute.side_effect = RuntimeError("boom")
+
+    assert StarRocksEngineSpec.get_catalog_names(database, inspector) == set()
+
+
+def test_get_schema_names_returns_databases(mocker: MockerFixture) -> None:
+    """
+    Test ``get_schema_names`` extracts the first column from SHOW DATABASES.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    inspector = mocker.MagicMock()
+    inspector.bind.execute.return_value = [
+        ("information_schema",),
+        ("sales",),
+        ("marketing",),
+    ]
+
+    schemas = StarRocksEngineSpec.get_schema_names(inspector)
+    inspector.bind.execute.assert_called_once_with("SHOW DATABASES")
+    assert schemas == {"information_schema", "sales", "marketing"}
+
+
+def test_get_schema_names_handles_execute_failure(mocker: MockerFixture) -> None:
+    """
+    Test ``get_schema_names`` returns an empty set when SHOW DATABASES raises.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    inspector = mocker.MagicMock()
+    inspector.bind.execute.side_effect = RuntimeError("boom")
+
+    assert StarRocksEngineSpec.get_schema_names(inspector) == set()
+
+
+def test_get_prequeries_no_effective_user(mocker: MockerFixture) -> None:
+    """
+    Test ``get_prequeries`` returns an empty list when impersonation is on
+    but no effective user can be resolved (e.g. anonymous request).
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    database.impersonate_user = True
+    database.get_effective_user.return_value = None
+
+    assert StarRocksEngineSpec.get_prequeries(database) == []
+
+
+def test_get_prequeries_empty_username(mocker: MockerFixture) -> None:
+    """
+    Test ``get_prequeries`` returns an empty list when ``get_effective_user``
+    returns an empty string (falsy).
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    database = mocker.MagicMock()
+    database.impersonate_user = True
+    database.get_effective_user.return_value = ""
+
+    assert StarRocksEngineSpec.get_prequeries(database) == []
+
+
+def test_metadata_describes_starrocks() -> None:
+    """
+    Test the ``metadata`` dict declares StarRocks-specific defaults.
+    """
+    from superset.db_engine_specs.starrocks import StarRocksEngineSpec
+
+    metadata = StarRocksEngineSpec.metadata
+    assert metadata["default_port"] == 9030
+    assert metadata["pypi_packages"] == ["starrocks"]
+    driver_names = {d["name"] for d in metadata["drivers"]}
+    assert {"starrocks", "mysqlclient", "PyMySQL"}.issubset(driver_names)
