@@ -21,7 +21,7 @@ import copy
 from collections import namedtuple
 from datetime import datetime
 from typing import Any, Optional
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, patch, PropertyMock
 
 import pandas as pd
 import pytest
@@ -1443,3 +1443,369 @@ def test_handle_cursor_commits_on_progress_text_change(
 
     # There should be commits for progress_text changes
     assert mock_db.session.commit.call_count >= 2
+
+
+def test_get_extra_table_metadata_no_indexes(mocker: MockerFixture) -> None:
+    """Test that get_extra_table_metadata returns empty dict when no indexes exist."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    db_mock = mocker.MagicMock()
+    db_mock.get_indexes = Mock(return_value=[])
+    db_mock.has_view = Mock(return_value=False)
+
+    result = TrinoEngineSpec.get_extra_table_metadata(
+        db_mock,
+        Table("test_table", "test_schema"),
+    )
+    assert result == {}
+
+
+def test_get_extra_table_metadata_no_latest_parts(mocker: MockerFixture) -> None:
+    """
+    Test that get_extra_table_metadata fills latest_parts with None when
+    latest_partition returns no partition values.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    db_mock = mocker.MagicMock()
+    db_mock.get_indexes = Mock(
+        return_value=[{"column_names": ["ds", "hour"], "name": "partition"}]
+    )
+    db_mock.has_view = Mock(return_value=False)
+
+    with (
+        patch.object(
+            TrinoEngineSpec,
+            "latest_partition",
+            return_value=(["ds", "hour"], None),
+        ),
+        patch.object(
+            TrinoEngineSpec,
+            "_partition_query",
+            return_value="SELECT 1",
+        ),
+    ):
+        result = TrinoEngineSpec.get_extra_table_metadata(
+            db_mock,
+            Table("test_table", "test_schema"),
+        )
+
+    assert result["partitions"]["latest"] == {"ds": None, "hour": None}
+    assert result["partitions"]["cols"] == ["ds", "hour"]
+
+
+def test_get_extra_table_metadata_with_view(mocker: MockerFixture) -> None:
+    """Test that get_extra_table_metadata returns view definition for views."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    db_mock = mocker.MagicMock()
+    db_mock.get_indexes = Mock(return_value=[])
+    db_mock.has_view = Mock(return_value=True)
+
+    inspector_mock = mocker.MagicMock()
+    inspector_mock.get_view_definition.return_value = "SELECT 1 FROM other_table"
+    db_mock.get_inspector.return_value.__enter__.return_value = inspector_mock
+
+    result = TrinoEngineSpec.get_extra_table_metadata(
+        db_mock,
+        Table("my_view", "test_schema", "test_catalog"),
+    )
+
+    assert result["view"] == "SELECT 1 FROM other_table"
+    db_mock.get_inspector.assert_called_once_with(
+        catalog="test_catalog",
+        schema="test_schema",
+    )
+
+
+def test_impersonate_user_no_username() -> None:
+    """Test that impersonate_user returns unchanged values when no username is given."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    url = make_url("trino://user:pass@localhost:8080/system")
+    engine_kwargs: dict[str, Any] = {}
+
+    result_url, result_kwargs = TrinoEngineSpec.impersonate_user(
+        database=Mock(),
+        username=None,
+        user_token=None,
+        url=url,
+        engine_kwargs=engine_kwargs,
+    )
+    assert result_url is url
+    assert result_kwargs is engine_kwargs
+    assert engine_kwargs == {}
+
+
+def test_impersonate_user_with_username() -> None:
+    """Test that impersonate_user adds the username to connect_args."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    url = make_url("trino://user:pass@localhost:8080/system")
+    engine_kwargs: dict[str, Any] = {}
+
+    _, result_kwargs = TrinoEngineSpec.impersonate_user(
+        database=Mock(),
+        username="impersonated_user",
+        user_token=None,
+        url=url,
+        engine_kwargs=engine_kwargs,
+    )
+    assert result_kwargs["connect_args"]["user"] == "impersonated_user"
+    assert "http_session" not in result_kwargs["connect_args"]
+
+
+def test_impersonate_user_with_username_and_token() -> None:
+    """
+    Test that impersonate_user adds both the username and a bearer-token http
+    session when a user token is provided.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    url = make_url("trino://user:pass@localhost:8080/system")
+    engine_kwargs: dict[str, Any] = {}
+
+    _, result_kwargs = TrinoEngineSpec.impersonate_user(
+        database=Mock(),
+        username="impersonated_user",
+        user_token="my-token",  # noqa: S106
+        url=url,
+        engine_kwargs=engine_kwargs,
+    )
+    connect_args = result_kwargs["connect_args"]
+    assert connect_args["user"] == "impersonated_user"
+    assert connect_args["http_session"].headers["Authorization"] == "Bearer my-token"
+
+
+def test_impersonate_user_non_trino_backend() -> None:
+    """
+    Test that impersonate_user does not modify connect_args when the backend is
+    not trino (e.g. presto).
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    url = make_url("presto://user:pass@localhost:8080/system")
+    engine_kwargs: dict[str, Any] = {}
+
+    _, result_kwargs = TrinoEngineSpec.impersonate_user(
+        database=Mock(),
+        username="impersonated_user",
+        user_token="my-token",  # noqa: S106
+        url=url,
+        engine_kwargs=engine_kwargs,
+    )
+    # connect_args is set up via setdefault but no fields are populated
+    assert result_kwargs["connect_args"] == {}
+
+
+def test_get_allow_cost_estimate() -> None:
+    """Test that get_allow_cost_estimate always returns True for Trino."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    assert TrinoEngineSpec.get_allow_cost_estimate({}) is True
+    assert TrinoEngineSpec.get_allow_cost_estimate({"some": "value"}) is True
+
+
+def test_get_tracking_url_via_info_uri() -> None:
+    """Test that get_tracking_url returns cursor.info_uri when available."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    cursor = Mock()
+    cursor.info_uri = "http://trino.example/ui/query.html?abc123"
+    assert TrinoEngineSpec.get_tracking_url(cursor) == (
+        "http://trino.example/ui/query.html?abc123"
+    )
+
+
+def test_get_tracking_url_fallback_to_connection() -> None:
+    """
+    Test that get_tracking_url falls back to constructing a URL from the
+    cursor's connection when info_uri is not available.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    cursor = MagicMock(spec=["connection", "_query"])
+    # Trigger AttributeError on info_uri
+    type(cursor).info_uri = PropertyMock(side_effect=AttributeError)
+    cursor.connection.http_scheme = "https"
+    cursor.connection.host = "trino.example"
+    cursor.connection.port = 8443
+    cursor._query.query_id = "q123"
+
+    assert TrinoEngineSpec.get_tracking_url(cursor) == (
+        "https://trino.example:8443/ui/query.html?q123"
+    )
+
+
+def test_get_tracking_url_returns_none_when_no_connection() -> None:
+    """
+    Test that get_tracking_url returns None when neither info_uri nor a usable
+    connection are available on the cursor.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    cursor = MagicMock(spec=[])
+    assert TrinoEngineSpec.get_tracking_url(cursor) is None
+
+
+@patch("superset.db_engine_specs.presto.PrestoBaseEngineSpec.handle_cursor")
+@patch("superset.db_engine_specs.trino.TrinoEngineSpec.cancel_query")
+@patch("superset.db_engine_specs.trino.db")
+@patch("superset.db_engine_specs.trino.app")
+def test_handle_cursor_without_tracking_url(
+    mock_app: Mock,
+    mock_db: Mock,
+    mock_cancel_query: Mock,
+    mock_presto_handle_cursor: Mock,
+    mocker: MockerFixture,
+) -> None:
+    """Test that handle_cursor does not set tracking_url when None is returned."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+    from superset.models.sql_lab import Query
+
+    mock_app.config = {"DB_POLL_INTERVAL_SECONDS": {"trino": 0}}
+
+    cursor_mock = mocker.MagicMock(spec=["query_id", "stats"])
+    cursor_mock.query_id = "test-query-id"
+    cursor_mock.stats = {"state": "FINISHED", "completedSplits": 0, "totalSplits": 0}
+
+    with patch.object(TrinoEngineSpec, "get_tracking_url", return_value=None):
+        query = Query()
+        query.status = "running"
+        TrinoEngineSpec.handle_cursor(cursor=cursor_mock, query=query)
+
+    assert query.tracking_url is None
+
+
+@patch("superset.db_engine_specs.presto.PrestoBaseEngineSpec.handle_cursor")
+@patch("superset.db_engine_specs.trino.TrinoEngineSpec.cancel_query")
+@patch("superset.db_engine_specs.trino.db")
+@patch("superset.db_engine_specs.trino.app")
+def test_handle_cursor_max_wait_time_timeout(
+    mock_app: Mock,
+    mock_db: Mock,
+    mock_cancel_query: Mock,
+    mock_presto_handle_cursor: Mock,
+    mocker: MockerFixture,
+) -> None:
+    """Test that handle_cursor exits when max_wait_time is exceeded."""
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+    from superset.models.sql_lab import Query
+
+    config_data = {
+        "DB_POLL_INTERVAL_SECONDS": {"trino": 0},
+        "SQLLAB_ASYNC_TIME_LIMIT_SEC": 1,
+    }
+    mock_app.config = MagicMock()
+    mock_app.config.__getitem__.side_effect = config_data.__getitem__
+    mock_app.config.get.side_effect = config_data.get
+
+    cursor_mock = mocker.MagicMock(spec=["query_id", "stats", "info_uri"])
+    cursor_mock.query_id = "test-query-id"
+    cursor_mock.stats = {"state": "RUNNING", "completedSplits": 0, "totalSplits": 10}
+
+    # Simulate clock jumping past max_wait_time on the first iteration of the loop
+    with patch(
+        "superset.db_engine_specs.trino.time.time",
+        side_effect=[0, 1000, 1001, 1002, 1003],
+    ):
+        with patch("superset.db_engine_specs.trino.time.sleep"):
+            query = Query()
+            query.id = 42
+            query.status = "running"
+            TrinoEngineSpec.handle_cursor(cursor=cursor_mock, query=query)
+
+    # cancel_query should not have been triggered by the timeout exit
+    mock_cancel_query.assert_not_called()
+
+
+def test_update_params_no_encrypted_extra() -> None:
+    """
+    Test that update_params_from_encrypted_extra is a no-op when the database
+    has no encrypted_extra.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    database = Mock()
+    database.encrypted_extra = None
+    params: dict[str, Any] = {}
+
+    TrinoEngineSpec.update_params_from_encrypted_extra(database, params)
+    assert params == {}
+
+
+def test_update_params_no_auth_method() -> None:
+    """
+    Test that update_params_from_encrypted_extra returns early when
+    encrypted_extra has no auth_method.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    database = Mock()
+    database.encrypted_extra = json.dumps({"some_other_key": "value"})
+    params: dict[str, Any] = {}
+
+    TrinoEngineSpec.update_params_from_encrypted_extra(database, params)
+    # No connect_args added because the function returned early.
+    assert params == {}
+
+
+def test_update_params_invalid_json() -> None:
+    """
+    Test that update_params_from_encrypted_extra re-raises JSONDecodeError when
+    encrypted_extra is malformed JSON, and logs the error.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    database = Mock()
+    database.encrypted_extra = "not valid json"
+    params: dict[str, Any] = {}
+
+    # Force `json.loads` (as imported in trino.py) to raise JSONDecodeError so
+    # we exercise the except-and-reraise branch reliably across simplejson C
+    # extension variants.
+    with (
+        patch(
+            "superset.db_engine_specs.trino.json.loads",
+            side_effect=json.JSONDecodeError("bad", "doc", 0),
+        ),
+        patch("superset.db_engine_specs.trino.logger") as mock_logger,
+    ):
+        with pytest.raises(json.JSONDecodeError):
+            TrinoEngineSpec.update_params_from_encrypted_extra(database, params)
+
+    assert mock_logger.error.called
+
+
+def test_execute_with_cursor_raises_error_from_thread(
+    app, mocker: MockerFixture
+) -> None:
+    """
+    Test that `execute_with_cursor` re-raises errors caught inside the spawned
+    execute thread after the event is set.
+    """
+    from superset.db_engine_specs.trino import TrinoEngineSpec
+
+    mock_cursor = mocker.MagicMock()
+    # query_id is non-empty so handle_cursor is exercised quickly
+    mock_cursor.query_id = "qid"
+    mock_cursor.stats = {"state": "FINISHED", "completedSplits": 0, "totalSplits": 0}
+
+    mock_query = mocker.MagicMock()
+
+    boom = RuntimeError("execution failed")
+
+    with app.test_request_context("/some/place/"):
+        with patch.object(TrinoEngineSpec, "execute", side_effect=boom):
+            with patch.object(TrinoEngineSpec, "handle_cursor"):
+                with patch.dict(
+                    "superset.config.DISALLOWED_SQL_FUNCTIONS",
+                    {},
+                    clear=True,
+                ):
+                    with pytest.raises(RuntimeError, match="execution failed"):
+                        TrinoEngineSpec.execute_with_cursor(
+                            cursor=mock_cursor,
+                            sql="SELECT 1 FROM foo",
+                            query=mock_query,
+                        )
